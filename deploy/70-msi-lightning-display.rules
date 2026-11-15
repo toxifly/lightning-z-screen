@@ -1,0 +1,6 @@
+# MSI RTX 5090 Lightning Z on-card screen (ArtInChip AiCast USB display, 0db0:7881).
+# Only the lightning-display service user may open it. Deliberately NO uaccess: desktop
+# apps such as Wine/Proton's wineusb would otherwise grab the driverless USB device and
+# fight the service for it (seen as the screen resetting every few seconds).
+SUBSYSTEM=="usb", ENV{DEVTYPE}=="usb_device", ATTR{idVendor}=="0db0", ATTR{idProduct}=="7881", MODE="0660", GROUP="lightning-display"
+SUBSYSTEM=="hidraw", ATTRS{idVendor}=="0db0", ATTRS{idProduct}=="7881", MODE="0660", GROUP="lightning-display", SYMLINK+="msi-lightning-display"

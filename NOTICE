@@ -1,0 +1,14 @@
+aicast.py
+  The AiCast USB protocol constants, handshake and the embedded RSA public key follow
+  hevnsnt/artinchip-linux (https://github.com/hevnsnt/artinchip-linux):
+    MIT License, Copyright (c) 2026 Bill Swearingen (hevnsnt)
+  The protocol was checked against ArtInChip's GPL-2.0 aic_drm_ud driver (Luban-Lite SDK).
+  No code from that driver is included.
+
+hidctl.py
+  An independent reimplementation of the MSI Lightning control framing, written for
+  interoperability. No MSI code or assets are included.
+
+wvread.py
+  Read-only Thermal Grizzly WireView Pro II reader. Its struct layouts follow
+  emaspa/wireview-linux (WireViewDeviceLib, wireview-hwmon).

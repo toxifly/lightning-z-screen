@@ -1,0 +1,4 @@
+pyusb
+pillow
+cryptography
+nvidia-ml-py

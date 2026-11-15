@@ -1,0 +1,22 @@
+[Unit]
+Description=MSI RTX 5090 Lightning Z screen: GPU monitor
+After=systemd-udev-settle.service nvidia-persistenced.service
+
+[Service]
+User=lightning-display
+Group=lightning-display
+SupplementaryGroups=dialout
+ExecStart=/opt/lightning-display/.venv/bin/python -I /opt/lightning-display/dashboard.py
+Restart=always
+RestartSec=5
+Nice=10
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+ProtectKernelTunables=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+
+[Install]
+WantedBy=multi-user.target
