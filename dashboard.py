@@ -110,7 +110,7 @@ class WireViews:
                         fd = wv.open_port(dev, wait_s=1.0)
                         try: s = wv.parse_sensor(wv.transact(fd, bytes([wv.CMD_READ_SENSOR_VALUES]), wv.SENSOR_SIZE))
                         finally: wv.close_port(fd)
-                    except OSError:
+                    except Exception:            # unplugged or busy (OSError, termios.error, ...)
                         s = None
                 if s:
                     self.data[name] = dict(s, t=time.monotonic())

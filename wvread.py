@@ -37,17 +37,21 @@ def open_port(path, wait_s=5.0):
             if e.errno != errno.EBUSY or time.monotonic() > deadline:
                 raise
             time.sleep(0.05)  # the app holds it for one transaction; retry
-    iflag, oflag, cflag, lflag, _, _, cc = termios.tcgetattr(fd)
-    iflag &= ~(termios.IGNBRK | termios.BRKINT | termios.PARMRK | termios.ISTRIP |
-               termios.INLCR | termios.IGNCR | termios.ICRNL | termios.IXON)
-    oflag &= ~termios.OPOST
-    lflag &= ~(termios.ECHO | termios.ECHONL | termios.ICANON | termios.ISIG | termios.IEXTEN)
-    cflag = (cflag & ~(termios.CSIZE | termios.PARENB | termios.CSTOPB)) | termios.CS8 | termios.CLOCAL | termios.CREAD
-    cc[termios.VMIN], cc[termios.VTIME] = 0, 0
-    termios.tcsetattr(fd, termios.TCSANOW,
-                      [iflag, oflag, cflag, lflag, termios.B115200, termios.B115200, cc])
-    time.sleep(0.1)  # opening makes the device send a welcome string; drop it
-    termios.tcflush(fd, termios.TCIOFLUSH)
+    try:
+        iflag, oflag, cflag, lflag, _, _, cc = termios.tcgetattr(fd)
+        iflag &= ~(termios.IGNBRK | termios.BRKINT | termios.PARMRK | termios.ISTRIP |
+                   termios.INLCR | termios.IGNCR | termios.ICRNL | termios.IXON)
+        oflag &= ~termios.OPOST
+        lflag &= ~(termios.ECHO | termios.ECHONL | termios.ICANON | termios.ISIG | termios.IEXTEN)
+        cflag = (cflag & ~(termios.CSIZE | termios.PARENB | termios.CSTOPB)) | termios.CS8 | termios.CLOCAL | termios.CREAD
+        cc[termios.VMIN], cc[termios.VTIME] = 0, 0
+        termios.tcsetattr(fd, termios.TCSANOW,
+                          [iflag, oflag, cflag, lflag, termios.B115200, termios.B115200, cc])
+        time.sleep(0.1)  # opening makes the device send a welcome string; drop it
+        termios.tcflush(fd, termios.TCIOFLUSH)
+    except BaseException:
+        os.close(fd)     # e.g. unplugged while opening (termios.error)
+        raise
     return fd
 
 
