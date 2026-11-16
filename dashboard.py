@@ -255,11 +255,12 @@ def render(W, H, gpu_name, g, c, wv, hist):
 class Dashboard:
     """The GPU monitor as a screen mode: renders a frame every 1/fps seconds.
 
-    With a Claude board it doubles as the Claude sessions view: while a session needs an answer or
-    has finished unseen (or always, with force=True, i.e. the "claude" mode) it shows the board
+    With a Claude board it doubles as the Claude sessions view: while a session is working, needs an
+    answer or has finished unseen (and HOLD seconds after; or always, with force=True, i.e. the "claude" mode) it shows the board
     instead, animated at claude_board.FPS, with the GPU numbers as a strip in its header."""
     done = False
     FADE = 0.5                           # seconds of cross-fade between the two views
+    HOLD = 20                            # seconds the board stays up after the last active session
 
     def __init__(self, gpu, cpu, wv, hist, w, h, rotate, fps, quality, board=None):
         self.gpu, self.cpu, self.wv, self.hist = gpu, cpu, wv, hist
@@ -268,6 +269,7 @@ class Dashboard:
         self.board, self.force = board, False
         self.sample, self.sampled = None, 0.0
         self.view, self.last, self.fade = "gpu", None, None
+        self.active_at = -1e9
 
     def read(self):
         """GPU and CPU readings, sampled (and added to the history) at most once per dashboard period."""
@@ -301,7 +303,11 @@ class Dashboard:
         return img.rotate(-self.rotate, expand=True) if self.rotate else img
 
     def next(self, timeout):
-        claude = bool(self.board) and (self.force or self.board.attention())
+        claude = False
+        if self.board:
+            if self.board.active():
+                self.active_at = time.monotonic()
+            claude = self.force or time.monotonic() - self.active_at < self.HOLD
         period = 1.0 / claude_board.FPS if (claude or self.fade) else self.period
         time.sleep(max(0.0, self.due - time.monotonic()))
         self.due = max(self.due + period, time.monotonic())

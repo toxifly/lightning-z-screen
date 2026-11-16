@@ -62,6 +62,10 @@ class Board:
     def attention(self):
         return any(s["state"] in ("needs", "done") for s in self.snapshot())
 
+    def active(self):
+        """Something to show: a session is working, needs an answer or finished unseen."""
+        return any(s["state"] in ("working", "needs", "done") for s in self.snapshot())
+
 
 def _num(v):
     try: return float(v)
