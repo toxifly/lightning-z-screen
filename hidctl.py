@@ -5,8 +5,9 @@ Frame (BYProtocol_x64.dll protocol_format): 0x5A | len16be(n+5) | payload | sum8
 then bytes between the delimiters are escaped 0x5A->5B 01, 0x5B->5B 02. Sent as one 1024-byte report (ID 0).
 Payload is HTTP-like text, e.g. "POST brightness 1\r\nSeqNumber=100\r\nContentType=json\r\nContentLength=N\r\n\r\n{json}".
 
-After power-on the screen plays its built-in animation; `conn` + `extendedDisplay` (what MSI's service
-sends whenever it finds the screen) switch it to showing the frames sent over USB.
+After power-on the screen plays its built-in animation; `conn` + `extendedDisplay {"enable":true}`
+(what MSI's service sends whenever it finds the screen) switch it to the frames sent over USB, and
+`{"enable":false}` switches it back. Without that, a warm reboot leaves the last frame frozen.
 """
 import glob, json, os, select, sys, time
 
@@ -60,14 +61,14 @@ class Ctl:
         return self._read()
     def brightness(self, v): self.post("brightness", {"value": int(v)}); return self._read(0.5)
     def rotate(self, deg): self.post("rotate", {"degree": int(deg)}); return self._read(0.5)
-    def extended(self): self.post("extendedDisplay", {"enable": True}, seq=110); return self._read(0.5)
+    def extended(self, on=True): self.post("extendedDisplay", {"enable": on}, seq=110); return self._read(0.5)
     def close(self): os.close(self.fd)
 
-def show_usb_frames():
-    """Switch the screen from its built-in animation to the USB picture (needed after power-on)."""
+def use_usb_frames(on=True):
+    """Show the frames sent over USB (on) or the screen's built-in animation (off)."""
     c = Ctl()
     try:
-        c.conn(); c.extended()
+        c.conn(); c.extended(on)
     finally:
         c.close()
 
@@ -76,7 +77,8 @@ if __name__ == "__main__":
     cmd = sys.argv[1] if len(sys.argv) > 1 else "conn"
     if cmd == "conn": r = c.conn()
     elif cmd == "extended": r = c.conn() + c.extended()
+    elif cmd == "animation": r = c.conn() + c.extended(False)
     elif cmd == "brightness": r = c.brightness(sys.argv[2])
     elif cmd == "rotate": r = c.rotate(sys.argv[2])
-    else: raise SystemExit("usage: hidctl.py conn|extended|brightness N|rotate DEG")
+    else: raise SystemExit("usage: hidctl.py conn|extended|animation|brightness N|rotate DEG")
     for x in r: print(repr(x))

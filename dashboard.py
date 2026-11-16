@@ -10,7 +10,7 @@ It can also show a web page or a video instead (see modes.py); switch with light
 
 Usage: dashboard.py [--rotate 0|90|180|270] [--fps 2] [--wireview NAME=DEV ...] [--preview out.png]
 """
-import argparse, collections, glob, io, os, sys, threading, time
+import argparse, collections, glob, io, os, signal, sys, threading, time
 from PIL import Image, ImageDraw, ImageFont
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -336,6 +336,7 @@ def main():
     if a.control:
         ctl.serve(a.control, a.control_users)
 
+    signal.signal(signal.SIGTERM, lambda *_: sys.exit())   # stop cleanly on systemctl stop / shutdown
     last, sent = None, 0.0
     while True:
         scr = aicast.Screen()
@@ -343,7 +344,7 @@ def main():
             scr.open()
             print(f"display connected: {scr.w}x{scr.h}", flush=True)
             try:
-                hidctl.show_usb_frames()          # leave the built-in animation (after power-on)
+                hidctl.use_usb_frames()           # leave the built-in animation (after power-on)
             except Exception as e:
                 print(f"control channel: {e}", flush=True)
             if (scr.w, scr.h) != (W, H):
@@ -362,7 +363,11 @@ def main():
                 sent = time.monotonic()
                 if isinstance(mode, modes.WebPage):  # the browser is paced by our frame acks
                     time.sleep(max(0.0, 1.0 / a.web_fps - (sent - t0)))
-        except KeyboardInterrupt:
+        except (KeyboardInterrupt, SystemExit):
+            try:
+                hidctl.use_usb_frames(False)      # back to MSI's animation, not a frozen frame
+            except Exception:
+                pass
             scr.close()
             return
         except Exception as e:  # unplugged, reset, not yet present...
