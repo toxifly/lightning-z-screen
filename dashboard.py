@@ -230,12 +230,13 @@ def render(W, H, gpu_name, g, c, wv, hist):
     if not wv:
         d.text((pad + 24, by + 70), "No WireView data", font=F["label"], fill=MUTED)
     else:
-        for i, (name, s) in enumerate(sorted(wv.items())):
+        for i, (name, s) in enumerate(wv.items()):
             yy = by + 62 + i * 92
             pins = [p[1] for p in s["pins"]]
             hi = max(pins)
             st = status_for(hi, PIN_WARN_A, PIN_CRIT_A)
-            d.text((pad + 24, yy), f"Connector {name.upper()}", font=F["label"], fill=INK2)
+            label = f"Connector {name.upper()}" if len(name) == 1 else f"{name.capitalize()} connector"
+            d.text((pad + 24, yy), label, font=F["label"], fill=INK2)
             d.text((pad + cw - 24, yy), f"{s['total_w']:.0f} W", font=F["label"], fill=INK, anchor="ra")
             meter(d, pad + 24, yy + 34, cw - 48, "Hottest pin", hi / PIN_CRIT_A,
                   f"{hi:.2f} A  ·  {max(s['ts'][:2]):.0f} °C", col=(st[1] if st else ACCENT))
@@ -263,7 +264,8 @@ class Dashboard:
         g, c = self.gpu.read(), self.cpu.read()
         self.hist["power"].append(g["power"]); self.hist["temp"].append(g["temp"])
         W, H = self.size[::-1] if self.rotate in (90, 270) else self.size
-        img = render(W, H, self.gpu.name, g, c, dict(self.wv.data) if self.wv else {}, self.hist)
+        wv = {n: self.wv.data[n] for n, _ in self.wv.devs if n in self.wv.data} if self.wv else {}
+        img = render(W, H, self.gpu.name, g, c, wv, self.hist)
         return img.rotate(-self.rotate, expand=True) if self.rotate else img
 
     def next(self, timeout):
@@ -284,8 +286,10 @@ def main():
     ap.add_argument("--web-fps", type=float, default=10.0, help="maximum frame rate in web mode")
     ap.add_argument("--video-fps", type=int, default=30, help="maximum frame rate in video mode")
     ap.add_argument("--quality", type=int, default=85)
-    ap.add_argument("--wireview", nargs="*", default=["a=/dev/wireview-pro2-a", "b=/dev/wireview-pro2-b"],
-                    help="NAME=DEVICE pairs; pass with no values to disable")
+    ap.add_argument("--wireview", nargs="*",
+                    default=os.environ.get("WIREVIEWS", "a=/dev/wireview-pro2-a b=/dev/wireview-pro2-b").split(),
+                    help="NAME=DEVICE pairs, shown in this order (default: $WIREVIEWS, or units a and b); "
+                         "pass with no values to disable")
     ap.add_argument("--control", default=os.path.join(os.environ["RUNTIME_DIRECTORY"], "control.sock")
                     if os.environ.get("RUNTIME_DIRECTORY") else None,
                     help="Unix socket for lightning-screen (mode switching); default: none outside systemd")
@@ -331,7 +335,8 @@ def main():
                                loop=bool(req.get("loop")), fill=bool(req.get("fill")), fd=fd)
         raise ValueError(f"unknown mode {m!r}")
 
-    ctl = control.Controller(make, os.environ.get("STATE_DIRECTORY"))
+    ctl = control.Controller(make, os.environ.get("STATE_DIRECTORY"),
+                             set_brightness=lambda v: hidctl.session(brightness=v))
     ctl.restore()
     if a.control:
         ctl.serve(a.control, a.control_users)
@@ -343,8 +348,10 @@ def main():
         try:
             scr.open()
             print(f"display connected: {scr.w}x{scr.h}", flush=True)
-            try:
-                hidctl.use_usb_frames()           # leave the built-in animation (after power-on)
+            try:                                 # leave the built-in animation (after power-on)
+                info = hidctl.session(usb_frames=True, brightness=ctl.brightness)
+                if ctl.brightness is None and isinstance(info.get("Brightness"), int):
+                    ctl.brightness = info["Brightness"]
             except Exception as e:
                 print(f"control channel: {e}", flush=True)
             if (scr.w, scr.h) != (W, H):
@@ -365,7 +372,7 @@ def main():
                     time.sleep(max(0.0, 1.0 / a.web_fps - (sent - t0)))
         except (KeyboardInterrupt, SystemExit):
             try:
-                hidctl.use_usb_frames(False)      # back to MSI's animation, not a frozen frame
+                hidctl.session(usb_frames=False)  # back to MSI's animation, not a frozen frame
             except Exception:
                 pass
             scr.close()

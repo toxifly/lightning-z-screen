@@ -3,6 +3,7 @@
 
   lightning-screen                         show the current mode
   lightning-screen dashboard               the GPU monitor (default)
+  lightning-screen brightness [0-100]      show or set the screen's brightness (kept across restarts)
   lightning-screen web URL                 a live web page, kept across restarts
   lightning-screen video FILE|URL [--loop] [--fill] [--startup]
                                            play a video (no sound), then return to the previous mode;
@@ -57,6 +58,7 @@ def main():
     sub = ap.add_subparsers(dest="mode")
     sub.add_parser("status")
     sub.add_parser("dashboard")
+    sub.add_parser("brightness").add_argument("value", nargs="?", type=int, help="0-100; omit to show it")
     sub.add_parser("web").add_argument("url")
     v = sub.add_parser("video")
     v.add_argument("source", help="video file, or a stream / video page URL")
@@ -72,6 +74,12 @@ def main():
         print(r["mode"] + (f" {what}" if what else "") + (" (on startup)" if r.get("startup") else ""))
     elif a.mode == "dashboard":
         ask({"mode": "dashboard"})
+    elif a.mode == "brightness":
+        if a.value is not None and not 0 <= a.value <= 100:
+            sys.exit("error: brightness is 0-100")
+        r = ask({"mode": "brightness"} if a.value is None else {"mode": "brightness", "value": a.value})
+        if a.value is None:
+            print("unknown" if r.get("value") is None else r["value"])
     elif a.mode == "web":
         url = a.url if "://" in a.url else "https://" + a.url
         ask({"mode": "web", "url": url})

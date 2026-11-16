@@ -6,6 +6,7 @@ Protocol: the client sends one JSON line and gets one JSON line back.
   {"mode": "video", "url": "...", "page": "...", "name": "...", "loop": false, "fill": false, "startup": false}
       (or an open file passed with SCM_RIGHTS instead of url/page)
   {"mode": "status"}
+  {"mode": "brightness", "value": 0-100}     (without "value": just report it)
 The dashboard, a web page or a "startup" video (which loops) is remembered across restarts; a
 temporary video returns to it when it ends.
 Only root, the service user and the users given with --control-users may connect.
@@ -13,7 +14,7 @@ Only root, the service user and the users given with --control-users may connect
 import json, os, pwd, shutil, socket, struct, threading, time
 
 STATE_FILE = "mode.json"
-
+BRIGHTNESS_FILE = "brightness"
 
 DASHBOARD = {"mode": "dashboard"}
 STARTUP_VIDEO = "startup-video"     # the service's own copy of a startup video file
@@ -24,12 +25,14 @@ class Controller:
     """Owns the current mode. The remembered mode (dashboard, web page or startup video) is
     restored at start, after a temporary video ends, and retried if it fails."""
 
-    def __init__(self, make, state_dir=None):
-        """make(request, fd) -> mode object; raises on bad requests."""
-        self.make, self.state_dir = make, state_dir
+    def __init__(self, make, state_dir=None, set_brightness=None):
+        """make(request, fd) -> mode object; raises on bad requests.
+        set_brightness(value) applies a brightness to the screen."""
+        self.make, self.state_dir, self.set_brightness = make, state_dir, set_brightness
         self.lock = threading.RLock()           # held for a whole switch (make() can take seconds)
         self.req, self.mode, self.since, self.retry_at = DASHBOARD, None, 0.0, None
         self.saved = self._load()
+        self.brightness = self._load_brightness()  # None: never set here, leave the screen's own
 
     # -- persistence --------------------------------------------------------------------------
     def _path(self, name):
@@ -43,6 +46,23 @@ class Controller:
                 return json.load(f)
         except (RuntimeError, OSError, ValueError):
             return DASHBOARD
+
+    def _load_brightness(self):
+        try:
+            with open(self._path(BRIGHTNESS_FILE)) as f:
+                return int(f.read())
+        except (RuntimeError, OSError, ValueError):
+            return None
+
+    def brighten(self, value):
+        value = max(0, min(100, int(value)))
+        if not self.set_brightness:
+            raise RuntimeError("brightness control is not available")
+        self.set_brightness(value)
+        self.brightness = value
+        if self.state_dir:
+            with open(self._path(BRIGHTNESS_FILE), "w") as f:
+                f.write(str(value))
 
     def _remember(self, req):
         self.saved = {k: v for k, v in req.items() if k != "url" or req["mode"] == "web"}
@@ -145,6 +165,10 @@ class Controller:
             req = json.loads(data)
             if req.get("mode") == "status":
                 return reply(conn, ok=True, **self.req)
+            if req.get("mode") == "brightness":
+                if "value" in req:
+                    self.brighten(req["value"])
+                return reply(conn, ok=True, value=self.brightness)
             self.switch(req, fds[0] if fds else None)
             reply(conn, ok=True, **req)
         except Exception as e:

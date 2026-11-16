@@ -29,10 +29,11 @@ lightning-screen video ~/Videos/clip.mp4 --loop   # a video (no sound); --fill c
 lightning-screen video https://youtu.be/...       # resolved with yt-dlp, if installed
 lightning-screen video clip.mp4 --startup         # loop it, and show it again after every restart
 lightning-screen dashboard                        # back to the GPU monitor
+lightning-screen brightness 60                    # 0-100, kept across restarts
 ```
 
 Or use the **Lightning Screen** app (`lightning-screen-gui`, GTK 4 / libadwaita): paste a link,
-pick or drop a file, or enter a web address.
+pick or drop a file, enter a web address, or set the brightness.
 
 - **Web** runs a headless Chrome/Chromium (needs `chromium` or `google-chrome` installed) at
   the screen's size and streams it, up to 10 fps. The mode is remembered across restarts.
@@ -45,8 +46,9 @@ pick or drop a file, or enter a web address.
   can't read your home directory. A `--startup` file is copied to `/var/lib/lightning-display`;
   a `--startup` link is resolved again at every start, because YouTube stream links expire.
 - Only root and the users in `CONTROL_USERS` (in `/etc/default/lightning-display`; the installer
-  puts in the user who ran `sudo`) may switch modes. After editing it, run
-  `sudo systemctl restart lightning-display`.
+  puts in the user who ran `sudo`) may switch modes. The same file can name the WireView units,
+  e.g. `WIREVIEWS="top=/dev/wireview-pro2-a bottom=/dev/wireview-pro2-b"`. After editing it,
+  run `sudo systemctl restart lightning-display`.
 
 ## Requirements
 
@@ -148,14 +150,15 @@ in `hidctl.py`.
 
 After power-on the screen plays MSI's built-in animation and ignores the AiCast frames until it
 receives `conn` followed by `extendedDisplay {"enable":true}`. MSI's service sends that whenever
-it finds the screen, and so does this one. Brightness and rotation have not been tried yet.
+it finds the screen, and so does this one; `{"enable":false}` hands the screen back to the
+animation when the service stops. `brightness` works the same way; rotation has not been tried.
 
 ## Status and caveats
 
 - Tested on one card.
 - This is not a desktop monitor. Linux doesn't see the screen as a display. ArtInChip's own Linux
   driver could do that, but it supports only Xorg.
-- Brightness and rotation over HID are untested; use `--rotate` for rotation.
+- Rotation over HID is untested; use `--rotate` for rotation.
 - This project is not affiliated with or endorsed by MSI or ArtInChip.
 
 ## Credits

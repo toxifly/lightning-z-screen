@@ -13,8 +13,12 @@ install -d -m 755 "$DST"
 install -m 644 "$SRC"/aicast.py "$SRC"/control.py "$SRC"/dashboard.py "$SRC"/hidctl.py "$SRC"/modes.py "$DST"/
 install -m 755 "$SRC/lightning-screen" "$SRC/lightning-screen-gui" /usr/local/bin/
 install -D -m 644 "$SRC/deploy/lightning-screen.desktop" /usr/local/share/applications/io.github.toxifly.LightningScreen.desktop
-# Who may switch modes; defaults to the user running sudo. Edit the file to change it.
-[ -f /etc/default/lightning-display ] || echo "CONTROL_USERS=\"${SUDO_USER:-}\"" > /etc/default/lightning-display
+# Settings: who may switch modes (defaults to the user running sudo) and WireView names.
+[ -f /etc/default/lightning-display ] || cat > /etc/default/lightning-display <<EOF
+CONTROL_USERS="${SUDO_USER:-}"
+# WireView Pro II units, NAME=DEVICE, shown in this order (default: a and b)
+#WIREVIEWS="top=/dev/wireview-pro2-a bottom=/dev/wireview-pro2-b"
+EOF
 [ -f "$SRC/wvread.py" ] && install -m 644 "$SRC/wvread.py" "$DST"/
 if [ ! -x "$DST/.venv/bin/python" ]; then
   python3 -m venv "$DST/.venv" 2>/dev/null || { UV="$(command -v uv || echo "${SUDO_USER:+/home/$SUDO_USER/.local/bin/uv}")"; "$UV" venv -q --python /usr/bin/python3 "$DST/.venv"; }

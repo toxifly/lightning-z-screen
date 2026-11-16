@@ -9,7 +9,7 @@ After power-on the screen plays its built-in animation; `conn` + `extendedDispla
 (what MSI's service sends whenever it finds the screen) switch it to the frames sent over USB, and
 `{"enable":false}` switches it back. Without that, a warm reboot leaves the last frame frozen.
 """
-import glob, json, os, select, sys, time
+import glob, json, os, select, sys, threading, time
 
 def find_hidraw():
     for p in sorted(glob.glob("/sys/class/hidraw/hidraw*")):
@@ -64,13 +64,27 @@ class Ctl:
     def extended(self, on=True): self.post("extendedDisplay", {"enable": on}, seq=110); return self._read(0.5)
     def close(self): os.close(self.fd)
 
-def use_usb_frames(on=True):
-    """Show the frames sent over USB (on) or the screen's built-in animation (off)."""
-    c = Ctl()
-    try:
-        c.conn(); c.extended(on)
-    finally:
-        c.close()
+_lock = threading.Lock()
+
+def session(usb_frames=None, brightness=None):
+    """One exchange on the control channel: `conn`, then optionally switch between the frames sent
+    over USB (True) and the built-in animation (False), and set the brightness (0-100).
+    Returns the screen's info from the `conn` reply (Brightness, Degree, Version, ...) or {}."""
+    with _lock:
+        c = Ctl()
+        try:
+            info = parse_info(c.conn())
+            if usb_frames is not None: c.extended(usb_frames)
+            if brightness is not None: c.brightness(brightness)
+            return info
+        finally:
+            c.close()
+
+def parse_info(replies):
+    for r in replies:
+        try: return json.loads(r[r.index("{"):r.rindex("}") + 1])
+        except ValueError: pass
+    return {}
 
 if __name__ == "__main__":
     c = Ctl()
