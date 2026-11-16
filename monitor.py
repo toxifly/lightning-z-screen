@@ -64,16 +64,16 @@ def _load():
     return _lib
 
 
-def edid(w, h, name=b"Lightning Z"):
-    """EDID 1.4 offering one mode, w x h at 60 Hz with CVT reduced blanking (9.6" panel)."""
+def edid(w, h, hz=60, name=b"Lightning Z"):
+    """EDID 1.4 offering one mode, w x h at hz with CVT reduced blanking (9.6" panel)."""
     hb, vb, hfp, hs, vfp, vs = 160, 23, 48, 32, 3, 6
-    clock = round((w + hb) * (h + vb) * 60 / 10_000)             # 10 kHz units
+    clock = round((w + hb) * (h + vb) * hz / 10_000)             # 10 kHz units
     mm_w, mm_h = (207, 129) if w >= h else (129, 207)
     dtd = bytes([clock & 0xFF, clock >> 8, w & 0xFF, hb & 0xFF, (w >> 8) << 4 | hb >> 8,
                  h & 0xFF, vb & 0xFF, (h >> 8) << 4 | vb >> 8, hfp, hs, vfp << 4 | vs, 0,
                  mm_w & 0xFF, mm_h & 0xFF, (mm_w >> 8) << 4 | mm_h >> 8, 0, 0, 0x1A])  # +hsync -vsync
     name_desc = bytes([0, 0, 0, 0xFC, 0]) + (name + b"\n").ljust(13, b" ")[:13]
-    limits = bytes([0, 0, 0, 0xFD, 0, 56, 61, 30, 80, 10, 1, 0x0A]) + b" " * 6
+    limits = bytes([0, 0, 0, 0xFD, 0, 24, 61, 20, 80, 10, 1, 0x0A]) + b" " * 6   # 24-61 Hz
     e = (b"\x00\xff\xff\xff\xff\xff\xff\x00"
          + bytes([0x36, 0x69, 0x81, 0x78, 1, 0, 0, 0, 1, 36, 1, 4])   # "MSI" 7881, 2026, EDID 1.4
          + bytes([0x80, mm_w // 10, mm_h // 10, 120, 0x06])            # digital, cm, gamma 2.2, sRGB
@@ -112,7 +112,9 @@ class Monitor:
         self.events = _Events(dpms=_INT(self._dpms), mode_changed=_MODE(self._mode),
                               update_ready=_INT(lambda *_: self._grab()), crtc_state=_INT(lambda *_: None))
         self.fd = lib.evdi_get_event_ready(self.h)
-        e = edid(lw, lh)
+        # The desktop renders (and copies) the monitor at its refresh rate, so offer no more than
+        # the frame rate sent to the screen: 30 Hz halves the desktop's work against 60 Hz.
+        e = edid(lw, lh, hz=max(24, min(60, round(max_fps))))
         lib.evdi_connect(self.h, e, len(e), lw * lh)                # the monitor appears now
         lib.evdi_enable_cursor_events(self.h, False)                # cursor drawn into the frames
 
