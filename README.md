@@ -57,6 +57,14 @@ pick or drop a file, enter a web address, use it as a monitor, or set the bright
   MOK manager screen at the next boot (on some graphics cards that screen stays black; the
   keys are Enter, ↓ Enter, ↓ Enter, ↓ Enter, password, Enter). Tested on GNOME 50 Wayland
   with the NVIDIA driver.
+- With an NVIDIA GPU, GNOME by default hands the monitor's frames over in GPU memory, which is
+  very slow for the CPU to read (the service then sits at 100 % in the kernel and lags). Have
+  GNOME copy them into system memory instead, then log out and in:
+  ```sh
+  mkdir -p ~/.config/environment.d
+  echo MUTTER_DEBUG_MULTI_GPU_FORCE_COPY_MODE=primary-gpu-cpu > ~/.config/environment.d/90-lightning-screen.conf
+  systemctl --user set-environment MUTTER_DEBUG_MULTI_GPU_FORCE_COPY_MODE=primary-gpu-cpu
+  ```
 - Only root and the users in `CONTROL_USERS` (in `/etc/default/lightning-display`; the installer
   puts in the user who ran `sudo`) may switch modes. The same file can name the WireView units,
   e.g. `WIREVIEWS="top=/dev/wireview-pro2-a bottom=/dev/wireview-pro2-b"`. After editing it,

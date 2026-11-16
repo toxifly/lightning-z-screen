@@ -83,6 +83,11 @@ def edid(w, h, name=b"Lightning Z"):
     return e + bytes([-sum(e) & 0xFF])
 
 
+# DRM pixel formats (fourcc) -> Pillow raw mode for the bytes in memory (little-endian)
+RAW_MODES = {b"XR24": "BGRX", b"AR24": "BGRX", b"XB24": "RGBX", b"AB24": "RGBX",
+             b"RX24": "XBGR", b"RA24": "XBGR", b"BX24": "XRGB", b"BA24": "XRGB"}
+
+
 class Monitor:
     """A screen mode; ``next()`` returns a JPEG when the desktop changed what's on the monitor."""
     done = False
@@ -102,6 +107,7 @@ class Monitor:
         self.rects = (_Rect * 16)()
         self.registered = self.waiting = self.dirty = self.closed = False
         self.blank = False                       # the desktop turned its screens off (DPMS)
+        self.raw = "BGRX"                        # XRGB8888 until the desktop sets a mode
         self.lock = threading.Lock()
         self.events = _Events(dpms=_INT(self._dpms), mode_changed=_MODE(self._mode),
                               update_ready=_INT(lambda *_: self._grab()), crtc_state=_INT(lambda *_: None))
@@ -112,6 +118,10 @@ class Monitor:
 
     # -- EVDI callbacks (run inside evdi_handle_events, under self.lock) ------------------------
     def _mode(self, m, _):
+        fourcc = m.pixel_format.to_bytes(4, "little")
+        self.raw = RAW_MODES.get(fourcc, "BGRX")
+        print(f"monitor: {m.width}x{m.height} @ {m.refresh_rate} Hz, {fourcc.decode(errors='replace')}"
+              + ("" if fourcc in RAW_MODES else " (unknown format, assuming XR24)"), flush=True)
         if (m.width, m.height) == self.size and not self.registered:
             w, h = self.size
             self.lib.evdi_register_buffer(self.h, _Buffer(1, ctypes.cast(self.pixels, ctypes.c_void_p),
@@ -148,7 +158,7 @@ class Monitor:
             if self.blank:
                 img = Image.new("RGB", self.size)
             else:
-                img = Image.frombuffer("RGB", self.size, self.pixels, "raw", "BGRX", 0, 1)
+                img = Image.frombuffer("RGB", self.size, self.pixels, "raw", self.raw, 0, 1)
             if self.rotate:
                 img = img.rotate(-self.rotate, expand=True)
             b = io.BytesIO()
