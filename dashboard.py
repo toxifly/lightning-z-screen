@@ -6,7 +6,8 @@ Renders a dashboard with Pillow and streams it as JPEG frames. Data sources:
   * hwmon k10temp + /proc/stat: CPU temperature and load
   * Thermal Grizzly WireView Pro II units (optional): per-connector power and per-pin current
 
-It can also show a web page or a video instead (see modes.py); switch with lightning-screen.
+It can also show a web page or a video (modes.py), or act as a desktop monitor (monitor.py);
+switch with lightning-screen.
 
 Usage: dashboard.py [--rotate 0|90|180|270] [--fps 2] [--wireview NAME=DEV ...] [--preview out.png]
 """
@@ -285,6 +286,7 @@ def main():
     ap.add_argument("--fps", type=float, default=2.0, help="dashboard frame rate")
     ap.add_argument("--web-fps", type=float, default=10.0, help="maximum frame rate in web mode")
     ap.add_argument("--video-fps", type=int, default=30, help="maximum frame rate in video mode")
+    ap.add_argument("--monitor-fps", type=float, default=30.0, help="maximum frame rate in monitor mode")
     ap.add_argument("--quality", type=int, default=85)
     ap.add_argument("--wireview", nargs="*",
                     default=os.environ.get("WIREVIEWS", "a=/dev/wireview-pro2-a b=/dev/wireview-pro2-b").split(),
@@ -333,6 +335,9 @@ def main():
                 url = modes.resolve(url)         # a remembered page link: get a fresh stream URL
             return modes.Video(url, W, H, a.rotate, a.video_fps, a.quality,
                                loop=bool(req.get("loop")), fill=bool(req.get("fill")), fd=fd)
+        if m == "monitor":
+            import monitor                       # only needs libevdi when used
+            return monitor.Monitor(W, H, a.rotate, a.monitor_fps, a.quality)
         raise ValueError(f"unknown mode {m!r}")
 
     ctl = control.Controller(make, os.environ.get("STATE_DIRECTORY"),

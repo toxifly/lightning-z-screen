@@ -3,12 +3,13 @@
 Protocol: the client sends one JSON line and gets one JSON line back.
   {"mode": "dashboard"}
   {"mode": "web", "url": "https://..."}
+  {"mode": "monitor"}                        (the desktop extends onto the screen)
   {"mode": "video", "url": "...", "page": "...", "name": "...", "loop": false, "fill": false, "startup": false}
       (or an open file passed with SCM_RIGHTS instead of url/page)
   {"mode": "status"}
   {"mode": "brightness", "value": 0-100}     (without "value": just report it)
-The dashboard, a web page or a "startup" video (which loops) is remembered across restarts; a
-temporary video returns to it when it ends.
+The dashboard, a web page, the desktop monitor or a "startup" video (which loops) is remembered
+across restarts; a temporary video returns to it when it ends.
 Only root, the service user and the users given with --control-users may connect.
 """
 import json, os, pwd, shutil, socket, struct, threading, time
@@ -97,7 +98,7 @@ class Controller:
             self.since, self.retry_at = time.monotonic(), None
             if old is not None and old is not new:
                 old.close()
-            if remember and (req["mode"] in ("dashboard", "web") or req.get("startup")):
+            if remember and (req["mode"] in ("dashboard", "web", "monitor") or req.get("startup")):
                 self._remember(req)
         print(f"mode: {describe(req)}", flush=True)
 

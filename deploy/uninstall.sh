@@ -5,7 +5,8 @@ set -euo pipefail
 systemctl disable --now lightning-display.service 2>/dev/null || true
 rm -f /etc/systemd/system/lightning-display.service /etc/udev/rules.d/70-msi-lightning-display.rules \
       /usr/local/bin/lightning-screen /usr/local/bin/lightning-screen-gui /etc/default/lightning-display \
-      /usr/local/share/applications/io.github.toxifly.LightningScreen.desktop
+      /usr/local/share/applications/io.github.toxifly.LightningScreen.desktop \
+      /etc/modules-load.d/lightning-display-evdi.conf /etc/modprobe.d/lightning-display-evdi.conf
 systemctl daemon-reload
 udevadm control --reload
 rm -rf /opt/lightning-display /var/cache/lightning-display-uv /var/cache/lightning-display /var/lib/lightning-display

@@ -4,7 +4,7 @@ Linux driver and GPU monitor for the built-in screen on the **MSI GeForce RTX 50
 
 MSI only supports the screen on Windows, through its browser-based Lightning Hub plus a Windows
 launcher app. This project talks to the screen directly over USB and streams a live hardware
-dashboard to it. It can also show a web page or play a video.
+dashboard to it. It can also show a web page, play a video, or act as a desktop monitor.
 
 ![dashboard](docs/dashboard.png)
 
@@ -20,7 +20,7 @@ dashboard to it. It can also show a web page or play a video.
 Cost: about 2–3 % of one CPU core and about 75 MB of RAM at the default 2 fps. It uses no GPU
 rendering; sensors are read through NVML.
 
-## Other modes: web page and video
+## Other modes: web page, video and desktop monitor
 
 ```sh
 lightning-screen                                  # what is showing now
@@ -28,12 +28,13 @@ lightning-screen web https://example.com          # a live web page
 lightning-screen video ~/Videos/clip.mp4 --loop   # a video (no sound); --fill crops instead of letterboxing
 lightning-screen video https://youtu.be/...       # resolved with yt-dlp, if installed
 lightning-screen video clip.mp4 --startup         # loop it, and show it again after every restart
+lightning-screen monitor                          # extend the desktop onto it (needs evdi)
 lightning-screen dashboard                        # back to the GPU monitor
 lightning-screen brightness 60                    # 0-100, kept across restarts
 ```
 
 Or use the **Lightning Screen** app (`lightning-screen-gui`, GTK 4 / libadwaita): paste a link,
-pick or drop a file, enter a web address, or set the brightness.
+pick or drop a file, enter a web address, use it as a monitor, or set the brightness.
 
 - **Web** runs a headless Chrome/Chromium (needs `chromium` or `google-chrome` installed) at
   the screen's size and streams it, up to 10 fps. The mode is remembered across restarts.
@@ -45,6 +46,17 @@ pick or drop a file, enter a web address, or set the brightness.
   `lightning-screen` as you and handed to the service as an open file, so the service still
   can't read your home directory. A `--startup` file is copied to `/var/lib/lightning-display`;
   a `--startup` link is resolved again at every start, because YouTube stream links expire.
+- **Monitor** plugs in a virtual 1280×800 display through EVDI, the kernel module DisplayLink
+  docks use, so GNOME (or any desktop) treats the screen as one more monitor: arrange it in
+  Settings → Displays and drag windows onto it. Whatever is drawn on it is sent as JPEG, only
+  when something changed, up to 30 fps. Compressing a frame takes about 2 ms, so CPU use stays
+  low even with motion.
+  Switching to another mode unplugs it. Needs `sudo apt install evdi-dkms libevdi1` before
+  running the installer. With Secure Boot on, the module must be signed with an enrolled key:
+  `sudo mokutil --import /var/lib/shim-signed/mok/MOK.der`, then confirm it in the blue
+  MOK manager screen at the next boot (on some graphics cards that screen stays black; the
+  keys are Enter, ↓ Enter, ↓ Enter, ↓ Enter, password, Enter). Tested on GNOME 50 Wayland
+  with the NVIDIA driver.
 - Only root and the users in `CONTROL_USERS` (in `/etc/default/lightning-display`; the installer
   puts in the user who ran `sudo`) may switch modes. The same file can name the WireView units,
   e.g. `WIREVIEWS="top=/dev/wireview-pro2-a bottom=/dev/wireview-pro2-b"`. After editing it,
@@ -156,8 +168,8 @@ animation when the service stops. `brightness` works the same way; rotation has 
 ## Status and caveats
 
 - Tested on one card.
-- This is not a desktop monitor. Linux doesn't see the screen as a display. ArtInChip's own Linux
-  driver could do that, but it supports only Xorg.
+- Linux doesn't see the screen as a display by itself; monitor mode makes it one through EVDI.
+  ArtInChip's own Linux driver could do that directly, but it supports only Xorg.
 - Rotation over HID is untested; use `--rotate` for rotation.
 - This project is not affiliated with or endorsed by MSI or ArtInChip.
 

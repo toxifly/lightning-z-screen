@@ -10,7 +10,8 @@ install -D -m 644 "$SRC/deploy/lightning-display.sysusers" /etc/sysusers.d/light
 systemd-sysusers /etc/sysusers.d/lightning-display.conf
 
 install -d -m 755 "$DST"
-install -m 644 "$SRC"/aicast.py "$SRC"/control.py "$SRC"/dashboard.py "$SRC"/hidctl.py "$SRC"/modes.py "$DST"/
+install -m 644 "$SRC"/aicast.py "$SRC"/control.py "$SRC"/dashboard.py "$SRC"/hidctl.py "$SRC"/modes.py \
+  "$SRC"/monitor.py "$DST"/
 install -m 755 "$SRC/lightning-screen" "$SRC/lightning-screen-gui" /usr/local/bin/
 install -D -m 644 "$SRC/deploy/lightning-screen.desktop" /usr/local/share/applications/io.github.toxifly.LightningScreen.desktop
 # Settings: who may switch modes (defaults to the user running sudo) and WireView names.
@@ -44,6 +45,13 @@ for d in /sys/bus/usb/devices/*; do
     ls -l "$n"
   done
 done
+
+# Desktop monitor mode: one EVDI virtual display, if evdi-dkms is installed.
+if modinfo evdi >/dev/null 2>&1; then
+  echo evdi > /etc/modules-load.d/lightning-display-evdi.conf
+  echo "options evdi initial_device_count=1" > /etc/modprobe.d/lightning-display-evdi.conf
+  lsmod | grep -q '^evdi ' || modprobe evdi || echo "evdi did not load (Secure Boot key not enrolled?)"
+fi
 
 install -m 644 "$SRC/deploy/lightning-display.service" /etc/systemd/system/lightning-display.service
 systemctl daemon-reload

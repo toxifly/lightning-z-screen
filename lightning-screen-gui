@@ -1,6 +1,6 @@
 #!/usr/bin/python3 -I
 """Small GNOME app for the Lightning Z screen: play a video (YouTube or any link, or a file),
-show a web page, or go back to the GPU dashboard. It drives the `lightning-screen` command."""
+show a web page, use it as a desktop monitor, or go back to the GPU dashboard. It drives the `lightning-screen` command."""
 import os, shutil, sys
 import gi
 gi.require_version("Gtk", "4.0")
@@ -77,6 +77,15 @@ class Window(Adw.ApplicationWindow):
         web.add(self.wurl)
         page.add(web)
 
+        # -- desktop monitor -------------------------------------------------------------------
+        mon = Adw.PreferencesGroup(title="Desktop Monitor",
+                                   description="Extend the desktop onto the screen like any other monitor; "
+                                               "arrange it in Settings → Displays.")
+        use = Adw.ButtonRow(title="Use as a Monitor", start_icon_name="video-display-symbolic")
+        use.connect("activated", lambda *_: self.run(["monitor"], "The screen is now a desktop monitor"))
+        mon.add(use)
+        page.add(mon)
+
         # drop a video file or a link anywhere on the window
         drop = Gtk.DropTarget.new(Gdk.FileList, Gdk.DragAction.COPY)
         drop.set_gtypes([Gdk.FileList, str])
@@ -108,7 +117,8 @@ class Window(Adw.ApplicationWindow):
                 self.status.set_subtitle("Screen service not running")
                 return
             mode, _, what = out.partition(" ")
-            label = {"dashboard": "GPU dashboard", "web": "Web page", "video": "Video"}.get(mode, mode)
+            label = {"dashboard": "GPU dashboard", "web": "Web page", "video": "Video",
+                     "monitor": "Desktop monitor"}.get(mode, mode)
             self.status.set_subtitle(GLib.markup_escape_text(f"{label}: {what}" if what else label))
             self.stop.set_visible(mode != "dashboard")
         self.cli(["status"], finished)

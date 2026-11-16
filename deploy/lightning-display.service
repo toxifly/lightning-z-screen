@@ -5,7 +5,8 @@ After=systemd-udev-settle.service nvidia-persistenced.service
 [Service]
 User=lightning-display
 Group=lightning-display
-SupplementaryGroups=dialout
+# dialout: WireView serial ports; video: the EVDI display (desktop monitor mode)
+SupplementaryGroups=dialout video
 # CONTROL_USERS: who may switch modes with lightning-screen (written by install.sh)
 EnvironmentFile=-/etc/default/lightning-display
 ExecStart=/opt/lightning-display/.venv/bin/python -I /opt/lightning-display/dashboard.py --control-users $CONTROL_USERS
