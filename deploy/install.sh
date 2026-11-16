@@ -11,7 +11,9 @@ systemd-sysusers /etc/sysusers.d/lightning-display.conf
 
 install -d -m 755 "$DST"
 install -m 644 "$SRC"/aicast.py "$SRC"/control.py "$SRC"/dashboard.py "$SRC"/hidctl.py "$SRC"/modes.py \
-  "$SRC"/monitor.py "$DST"/
+  "$SRC"/monitor.py "$SRC"/claude_board.py "$DST"/
+install -d -m 755 "$DST/fonts"
+install -m 644 "$SRC"/fonts/*.ttf "$SRC"/fonts/OFL-*.txt "$DST/fonts"/
 install -m 755 "$SRC/lightning-screen" "$SRC/lightning-screen-gui" /usr/local/bin/
 install -D -m 644 "$SRC/deploy/lightning-screen.desktop" /usr/local/share/applications/io.github.toxifly.LightningScreen.desktop
 # Settings: who may switch modes (defaults to the user running sudo) and WireView names.

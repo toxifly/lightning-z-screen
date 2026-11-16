@@ -118,7 +118,7 @@ class Window(Adw.ApplicationWindow):
                 return
             mode, _, what = out.partition(" ")
             label = {"dashboard": "GPU dashboard", "web": "Web page", "video": "Video",
-                     "monitor": "Desktop monitor"}.get(mode, mode)
+                     "monitor": "Desktop monitor", "claude": "Claude sessions"}.get(mode, mode)
             self.status.set_subtitle(GLib.markup_escape_text(f"{label}: {what}" if what else label))
             self.stop.set_visible(mode != "dashboard")
         self.cli(["status"], finished)

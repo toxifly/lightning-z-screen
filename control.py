@@ -8,7 +8,9 @@ Protocol: the client sends one JSON line and gets one JSON line back.
       (or an open file passed with SCM_RIGHTS instead of url/page)
   {"mode": "status"}
   {"mode": "brightness", "value": 0-100}     (without "value": just report it)
-The dashboard, a web page, the desktop monitor or a "startup" video (which loops) is remembered
+  {"mode": "claude"}                         (the Claude sessions board, kept on screen)
+  {"mode": "claude-status", "sessions": [...]}  (session list from the claude-board agent; no switch)
+The dashboard, a web page, the desktop monitor, the Claude board or a "startup" video (which loops) is remembered
 across restarts; a temporary video returns to it when it ends.
 Only root, the service user and the users given with --control-users may connect.
 """
@@ -26,10 +28,12 @@ class Controller:
     """Owns the current mode. The remembered mode (dashboard, web page or startup video) is
     restored at start, after a temporary video ends, and retried if it fails."""
 
-    def __init__(self, make, state_dir=None, set_brightness=None):
+    def __init__(self, make, state_dir=None, set_brightness=None, on_claude_status=None):
         """make(request, fd) -> mode object; raises on bad requests.
-        set_brightness(value) applies a brightness to the screen."""
+        set_brightness(value) applies a brightness to the screen.
+        on_claude_status(sessions) receives the Claude session list (claude_board.Board.update)."""
         self.make, self.state_dir, self.set_brightness = make, state_dir, set_brightness
+        self.on_claude_status = on_claude_status
         self.lock = threading.RLock()           # held for a whole switch (make() can take seconds)
         self.req, self.mode, self.since, self.retry_at = DASHBOARD, None, 0.0, None
         self.saved = self._load()
@@ -98,7 +102,7 @@ class Controller:
             self.since, self.retry_at = time.monotonic(), None
             if old is not None and old is not new:
                 old.close()
-            if remember and (req["mode"] in ("dashboard", "web", "monitor") or req.get("startup")):
+            if remember and (req["mode"] in ("dashboard", "web", "monitor", "claude") or req.get("startup")):
                 self._remember(req)
         print(f"mode: {describe(req)}", flush=True)
 
@@ -166,6 +170,12 @@ class Controller:
             req = json.loads(data)
             if req.get("mode") == "status":
                 return reply(conn, ok=True, **self.req)
+            if req.get("mode") == "claude-status":
+                if not self.on_claude_status:
+                    return reply(conn, ok=False, error="the Claude board is not available")
+                sessions = req.get("sessions")
+                self.on_claude_status(sessions if isinstance(sessions, list) else [])
+                return reply(conn, ok=True)
             if req.get("mode") == "brightness":
                 if "value" in req:
                     self.brighten(req["value"])

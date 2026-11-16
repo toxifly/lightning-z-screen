@@ -12,3 +12,11 @@ hidctl.py
 wvread.py
   Read-only Thermal Grizzly WireView Pro II reader. Its struct layouts follow
   emaspa/wireview-linux (WireViewDeviceLib, wireview-hwmon).
+
+fonts/Inter.ttf, fonts/SourceSerif4.ttf  (claude-board branch only)
+  Inter (Rasmus Andersson) and Source Serif 4 (Adobe), SIL Open Font License 1.1;
+  see fonts/OFL-Inter.txt and fonts/OFL-SourceSerif4.txt.
+
+claude_board.py  (claude-board branch only, not for publishing)
+  The spark logo and pixel mascot imitate Anthropic's Claude / Claude Code branding,
+  for personal use on this screen.

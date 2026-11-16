@@ -2,7 +2,9 @@
 """Switch what the Lightning Z screen shows.
 
   lightning-screen                         show the current mode
-  lightning-screen dashboard               the GPU monitor (default)
+  lightning-screen dashboard               the GPU monitor (default); turns into the Claude sessions
+                                           board while a session needs you or has finished unseen
+  lightning-screen claude                  keep the Claude sessions board on screen
   lightning-screen brightness [0-100]      show or set the screen's brightness (kept across restarts)
   lightning-screen web URL                 a live web page, kept across restarts
   lightning-screen monitor                 use it as a desktop monitor (needs evdi), kept across restarts
@@ -62,6 +64,7 @@ def main():
     sub.add_parser("brightness").add_argument("value", nargs="?", type=int, help="0-100; omit to show it")
     sub.add_parser("web").add_argument("url")
     sub.add_parser("monitor")
+    sub.add_parser("claude")
     v = sub.add_parser("video")
     v.add_argument("source", help="video file, or a stream / video page URL")
     v.add_argument("--loop", action="store_true", help="repeat until another mode is chosen")
@@ -74,7 +77,7 @@ def main():
         r = ask({"mode": "status"})
         what = r.get("name") or r.get("url")
         print(r["mode"] + (f" {what}" if what else "") + (" (on startup)" if r.get("startup") else ""))
-    elif a.mode in ("dashboard", "monitor"):
+    elif a.mode in ("dashboard", "monitor", "claude"):
         ask({"mode": a.mode})
     elif a.mode == "brightness":
         if a.value is not None and not 0 <= a.value <= 100:

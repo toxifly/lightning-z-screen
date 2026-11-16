@@ -1,0 +1,304 @@
+#!/usr/bin/python3 -I
+"""Feed the Lightning Z screen's Claude sessions board.
+
+  claude-board hook           Claude Code hook: reads the hook event (JSON) on stdin and records the
+                              session's state. Installed in ~/.claude/settings.json.
+  claude-board run            the agent (systemd user unit claude-board.service): tracks sessions,
+                              their tmux position and title, and whether you have looked at them, and
+                              pushes the list to the screen service once a second when it changes.
+  claude-board list           print the sessions as the screen sees them
+  claude-board seen [all|ID]  mark finished sessions as seen (e.g. ones in the Claude app)
+
+States: needs (waiting for an answer, a permission or a plan approval), done (finished, not looked
+at yet), working, idle (finished and seen). A finished session counts as seen when its tmux pane
+is the focused pane for a second (or was already focused when it finished), or when you send it a
+message. The screen service only ever receives the list; it never reads your files.
+"""
+import json, os, re, socket, subprocess, sys, time
+
+STATE = os.path.join(os.environ.get("XDG_STATE_HOME") or os.path.expanduser("~/.local/state"), "claude-board")
+SOCK = os.environ.get("LIGHTNING_SCREEN_SOCKET", "/run/lightning-display/control.sock")
+HOME = os.path.expanduser("~")
+ASK_TOOLS = {"AskUserQuestion": "Claude is asking you a question",
+             "ExitPlanMode": "Claude wants you to approve a plan"}
+NEEDS_NOTES = ("permission_prompt", "elicitation_dialog")
+SEEN_AFTER = 1.0          # seconds a pane must have focus to count as looked at
+RESEND = 10               # push at least this often, so the screen knows the agent is alive
+SHELLS = {"sh", "bash", "dash", "zsh", "fish"}
+
+
+# ---- per-session state files --------------------------------------------------------------------
+def path(sid):
+    return os.path.join(STATE, re.sub(r"[^A-Za-z0-9_.-]", "_", sid) + ".json")
+
+
+def load(sid):
+    try:
+        with open(path(sid)) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return None
+
+
+def save(s):
+    os.makedirs(STATE, mode=0o700, exist_ok=True)
+    tmp = f"{path(s['id'])}.{os.getpid()}.tmp"
+    with open(tmp, "w") as f:
+        json.dump(s, f)
+    os.replace(tmp, path(s["id"]))
+
+
+def remove(sid):
+    try: os.unlink(path(sid))
+    except OSError: pass
+
+
+def all_sessions():
+    out = []
+    try: names = os.listdir(STATE)
+    except OSError: return out
+    for n in names:
+        if n.endswith(".json"):
+            try:
+                with open(os.path.join(STATE, n)) as f:
+                    out.append(json.load(f))
+            except (OSError, ValueError):
+                pass
+    return out
+
+
+# ---- hook ----------------------------------------------------------------------------------------
+def claude_pid():
+    """The Claude Code process that ran this hook (walks up past the shell)."""
+    pid = os.getppid()
+    for _ in range(6):
+        try:
+            exe = os.readlink(f"/proc/{pid}/exe")
+            with open(f"/proc/{pid}/cmdline", "rb") as f:
+                argv = f.read().split(b"\0")[:2]
+            with open(f"/proc/{pid}/stat") as f:
+                ppid = int(f.read().rsplit(")", 1)[1].split()[1])
+        except (OSError, ValueError, IndexError):
+            return None
+        names = [os.path.basename(a.decode(errors="replace")) for a in argv]
+        if os.path.basename(exe) not in SHELLS and ("/claude" in exe or any("claude" in n for n in names)):
+            return pid
+        if ppid <= 1:
+            return None
+        pid = ppid
+    return None
+
+
+def hook():
+    try:
+        ev = json.load(sys.stdin)
+    except ValueError:
+        return
+    sid, name = ev.get("session_id"), ev.get("hook_event_name")
+    if not sid or not name:
+        return
+    if name == "SessionEnd":
+        return remove(sid)
+    s = load(sid)
+    if name == "PostToolUse" and not (s and s.get("state") == "needs"):
+        return                                   # the common case: nothing to do, stay fast
+    now = time.time()
+    s = s or {"id": sid, "state": "idle", "since": now, "seen": True, "msg": ""}
+    s["cwd"] = ev.get("cwd") or s.get("cwd") or ""
+    s["transcript"] = ev.get("transcript_path") or s.get("transcript") or ""
+    if os.environ.get("TMUX_PANE"):
+        s["pane"] = os.environ["TMUX_PANE"]
+    if os.environ.get("CLAUDE_CODE_ENTRYPOINT"):
+        s["entry"] = os.environ["CLAUDE_CODE_ENTRYPOINT"]
+    pid = claude_pid()
+    if pid:
+        s["pid"] = pid
+
+    def to(state, seen, msg=""):
+        s.update(state=state, since=now, seen=seen, msg=msg)
+
+    tool = ev.get("tool_name")
+    if name == "SessionStart":
+        to("idle", True)
+    elif name == "UserPromptSubmit":
+        to("working", True)
+    elif name == "Stop":
+        to("done", False)
+    elif name == "PreToolUse" and tool in ASK_TOOLS:
+        to("needs", False, ASK_TOOLS[tool])
+    elif name == "PostToolUse":                  # answered / permission granted: back to work
+        to("working", True)
+    elif name == "Notification":
+        kind, msg = ev.get("notification_type") or "", ev.get("message") or ""
+        if kind in NEEDS_NOTES or (not kind and "permission" in msg.lower()):
+            to("needs", False, msg)
+    save(s)
+
+
+# ---- agent ---------------------------------------------------------------------------------------
+def alive(pid):
+    try:
+        os.kill(int(pid), 0)
+        return True
+    except (ProcessLookupError, ValueError, TypeError):
+        return False
+    except PermissionError:
+        return True
+
+
+def tmux():
+    """{pane_id: (session, window, pane, title)}, {focused pane ids}"""
+    def run(*args):
+        try:
+            return subprocess.run(["tmux", *args], capture_output=True, text=True, timeout=2).stdout
+        except (OSError, subprocess.TimeoutExpired):
+            return ""
+    panes = {}
+    for line in run("list-panes", "-a", "-F", "#{pane_id}\t#{session_name}\t#{window_index}\t#{pane_index}\t#{pane_title}").splitlines():
+        p = line.split("\t", 4)
+        if len(p) == 5:
+            panes[p[0]] = tuple(p[1:])
+    focused = set()
+    for line in run("list-clients", "-F", "#{client_flags}\t#{pane_id}").splitlines():
+        flags, _, pane = line.partition("\t")
+        if "focused" in flags.split(","):
+            focused.add(pane)
+    return panes, focused
+
+
+_titles = {}
+
+
+def transcript_title(tpath):
+    """The session's latest title from its transcript (read from the end; cached by size)."""
+    try:
+        size = os.path.getsize(tpath)
+    except (OSError, TypeError):
+        return ""
+    hit = _titles.get(tpath)
+    if hit and hit[0] == size:
+        return hit[1]
+    title = ""
+    try:
+        with open(tpath, "rb") as f:
+            f.seek(max(0, size - (1 << 20)))
+            for line in reversed(f.read().splitlines()):
+                if b'"custom-title"' in line or b'"ai-title"' in line:
+                    try:
+                        j = json.loads(line)
+                    except ValueError:
+                        continue
+                    title = j.get("customTitle") or j.get("aiTitle") or j.get("title") or ""
+                    if title:
+                        break
+    except OSError:
+        pass
+    _titles[tpath] = (size, title)
+    return title
+
+
+def clean_title(t):
+    t = re.sub(r"^[^\w(\[\"']+", "", t or "").strip()      # Claude's spinner glyph in pane titles
+    return "" if t in ("", "claude", "Claude Code", socket.gethostname()) else t
+
+
+def run():
+    focus_start, last_sent, last_payload = {}, 0.0, None
+    while True:
+        now = time.time()
+        panes, focused = tmux()
+        for p in list(focus_start):
+            if p not in focused:
+                del focus_start[p]
+        for p in focused:
+            focus_start.setdefault(p, now)
+
+        out = []
+        for s in all_sessions():
+            sid = s.get("id")
+            if not sid:
+                continue
+            if s.get("pid") and not alive(s["pid"]):
+                remove(sid)
+                continue
+            if not s.get("pid") and now - s.get("since", 0) > 86400:
+                remove(sid)
+                continue
+            pane = s.get("pane")
+            in_tmux = pane in panes
+            # looked at: its pane has had focus for a second, or already had it when it finished
+            if s.get("state") == "done" and not s.get("seen") and in_tmux and pane in focus_start:
+                fs = focus_start[pane]
+                if fs <= s.get("since", 0) or now - fs >= SEEN_AFTER:
+                    s["seen"] = mark_seen(sid, s.get("since"))
+            state = s.get("state", "idle")
+            if state == "done" and s.get("seen"):
+                state = "idle"
+            cwd = s.get("cwd") or ""
+            project = "~" if cwd.rstrip("/") == HOME else os.path.basename(cwd.rstrip("/")) or cwd
+            if in_tmux:
+                sess, win, pn, ptitle = panes[pane]
+                pos, where = (f"{win}.{pn}" if sess == "main" else f"{sess}:{win}.{pn}"), "tmux"
+            else:
+                ptitle, pos = "", ""
+                entry = s.get("entry", "")
+                where = "app" if "desktop" in entry else ("vscode" if ("vscode" in entry or "ide" in entry) else "terminal")
+            title = clean_title(ptitle) or transcript_title(s.get("transcript")) or ""
+            out.append({"id": sid, "title": title, "project": project, "pos": pos, "where": where,
+                        "state": state, "since": s.get("since", now), "msg": s.get("msg", "")})
+
+        out.sort(key=lambda x: x["id"])
+        payload = json.dumps({"mode": "claude-status", "sessions": out})
+        if payload != last_payload or now - last_sent >= RESEND:
+            if send(payload):
+                last_payload, last_sent = payload, now
+        time.sleep(1.0)
+
+
+def mark_seen(sid, since):
+    """Mark as seen, unless a hook has changed the session since we read it."""
+    s = load(sid)
+    if not s or s.get("state") != "done" or s.get("since") != since:
+        return False
+    s["seen"] = True
+    save(s)
+    return True
+
+
+def send(payload):
+    try:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as c:
+            c.settimeout(3)
+            c.connect(SOCK)
+            c.sendall(payload.encode() + b"\n")
+            c.recv(4096)
+        return True
+    except OSError:
+        return False                             # screen service not running; try again next round
+
+
+def main():
+    cmd = sys.argv[1] if len(sys.argv) > 1 else "list"
+    if cmd == "hook":
+        try:
+            hook()
+        except Exception:
+            pass                                 # never get in Claude's way
+    elif cmd == "run":
+        run()
+    elif cmd == "list":
+        for s in sorted(all_sessions(), key=lambda s: s.get("since", 0)):
+            state = "idle" if s.get("state") == "done" and s.get("seen") else s.get("state")
+            print(f"{state:8} {s.get('pane', '-'):5} {s.get('cwd', '')}  {s['id']}")
+    elif cmd == "seen":
+        which = sys.argv[2] if len(sys.argv) > 2 else "all"
+        for s in all_sessions():
+            if s.get("state") == "done" and which in ("all", s["id"]):
+                s["seen"] = True
+                save(s)
+    else:
+        sys.exit(__doc__)
+
+
+if __name__ == "__main__":
+    main()

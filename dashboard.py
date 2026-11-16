@@ -15,7 +15,7 @@ import argparse, collections, glob, io, os, signal, sys, threading, time
 from PIL import Image, ImageDraw, ImageFont
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-import aicast, control, hidctl, modes  # noqa: E402
+import aicast, claude_board, control, hidctl, modes  # noqa: E402
 
 # ---- palette (dataviz reference palette, dark mode) -------------------------------------------
 SURFACE, CARD, TRACK = "#1a1a19", "#232321", "#383835"
@@ -253,27 +253,75 @@ def render(W, H, gpu_name, g, c, wv, hist):
 
 
 class Dashboard:
-    """The GPU monitor as a screen mode: renders a frame every 1/fps seconds."""
-    done = False
+    """The GPU monitor as a screen mode: renders a frame every 1/fps seconds.
 
-    def __init__(self, gpu, cpu, wv, hist, w, h, rotate, fps, quality):
+    With a Claude board it doubles as the Claude sessions view: while a session needs an answer or
+    has finished unseen (or always, with force=True, i.e. the "claude" mode) it shows the board
+    instead, animated at claude_board.FPS, with the GPU numbers as a strip in its header."""
+    done = False
+    FADE = 0.5                           # seconds of cross-fade between the two views
+
+    def __init__(self, gpu, cpu, wv, hist, w, h, rotate, fps, quality, board=None):
         self.gpu, self.cpu, self.wv, self.hist = gpu, cpu, wv, hist
         self.size, self.rotate, self.period, self.quality = (w, h), rotate, 1.0 / fps, quality
         self.due = time.monotonic()
+        self.board, self.force = board, False
+        self.sample, self.sampled = None, 0.0
+        self.view, self.last, self.fade = "gpu", None, None
 
-    def image(self):
-        g, c = self.gpu.read(), self.cpu.read()
-        self.hist["power"].append(g["power"]); self.hist["temp"].append(g["temp"])
-        W, H = self.size[::-1] if self.rotate in (90, 270) else self.size
+    def read(self):
+        """GPU and CPU readings, sampled (and added to the history) at most once per dashboard period."""
+        now = time.monotonic()
+        if self.sample is None or now - self.sampled >= self.period * 0.9:
+            g, c = self.gpu.read(), self.cpu.read()
+            self.hist["power"].append(g["power"]); self.hist["temp"].append(g["temp"])
+            self.sample, self.sampled = (g, c), now
+        return self.sample
+
+    def _wh(self):
+        return self.size[::-1] if self.rotate in (90, 270) else self.size
+
+    def gpu_frame(self):
+        g, c = self.read()
+        W, H = self._wh()
         wv = {n: self.wv.data[n] for n, _ in self.wv.devs if n in self.wv.data} if self.wv else {}
         img = render(W, H, self.gpu.name, g, c, wv, self.hist)
+        if self.board:
+            clock_w = ImageDraw.Draw(img).textlength(time.strftime("%H:%M"), font=F["title"])
+            claude_board.badge(img, W - 24 - clock_w - 20, 18, self.board.snapshot(), time.time())
+        return img
+
+    def claude_frame(self):
+        g, c = self.read()
+        W, H = self._wh()
+        return claude_board.render(W, H, self.board.snapshot(), g, c).convert("RGB")
+
+    def image(self):
+        img = self.gpu_frame()
         return img.rotate(-self.rotate, expand=True) if self.rotate else img
 
     def next(self, timeout):
+        claude = bool(self.board) and (self.force or self.board.attention())
+        period = 1.0 / claude_board.FPS if (claude or self.fade) else self.period
         time.sleep(max(0.0, self.due - time.monotonic()))
-        self.due = max(self.due + self.period, time.monotonic())
+        self.due = max(self.due + period, time.monotonic())
+        img = self.claude_frame() if claude else self.gpu_frame()
+        view = "claude" if claude else "gpu"
+        now = time.monotonic()
+        if view != self.view:
+            self.fade = (self.last, now) if self.last is not None else None
+            self.view = view
+        if self.fade:
+            k = (now - self.fade[1]) / self.FADE
+            if k >= 1 or self.fade[0].size != img.size:
+                self.fade = None
+            else:
+                img = Image.blend(self.fade[0], img, k * k * (3 - 2 * k))   # smoothstep
+        self.last = img
+        if self.rotate:
+            img = img.rotate(-self.rotate, expand=True)
         b = io.BytesIO()
-        self.image().convert("RGB").save(b, "JPEG", quality=self.quality)
+        img.convert("RGB").save(b, "JPEG", quality=self.quality)
         return b.getvalue()
 
     def close(self):
@@ -304,7 +352,8 @@ def main():
     gpu, cpu = Gpu(), Cpu()
     wv = WireViews([tuple(x.split("=", 1)) for x in a.wireview]) if a.wireview else None
     hist = dict(power=collections.deque(maxlen=HIST), temp=collections.deque(maxlen=HIST))
-    dash = Dashboard(gpu, cpu, wv, hist, W, H, a.rotate, a.fps, a.quality)
+    board = claude_board.Board()
+    dash = Dashboard(gpu, cpu, wv, hist, W, H, a.rotate, a.fps, a.quality, board=board)
 
     if a.preview:
         time.sleep(1.5)  # let CPU load / WireView get a sample
@@ -316,7 +365,8 @@ def main():
 
     def make(req, fd):
         m = req.get("mode")
-        if m == "dashboard":
+        if m in ("dashboard", "claude"):
+            dash.force = m == "claude"           # claude: keep the sessions board on screen
             return dash
         if m == "web":
             if not str(req.get("url", "")).startswith(("http://", "https://")):
@@ -341,7 +391,8 @@ def main():
         raise ValueError(f"unknown mode {m!r}")
 
     ctl = control.Controller(make, os.environ.get("STATE_DIRECTORY"),
-                             set_brightness=lambda v: hidctl.session(brightness=v))
+                             set_brightness=lambda v: hidctl.session(brightness=v),
+                             on_claude_status=board.update)
     ctl.restore()
     if a.control:
         ctl.serve(a.control, a.control_users)
