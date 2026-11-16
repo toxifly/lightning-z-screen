@@ -40,12 +40,12 @@ class Ctl:
         assert len(f) <= 1024, "payload too long"
         os.write(self.fd, b"\x00" + f.ljust(1024, b"\x00"))
         time.sleep(0.01)
-    def _read(self, timeout=1.0):
+    def _read(self, timeout=1.0, want=None):
+        """Replies that arrive within timeout; return early once `want` of them have."""
         out = []
         end = time.monotonic() + timeout
-        while time.monotonic() < end:
-            r, _, _ = select.select([self.fd], [], [], 0.1)
-            if r:
+        while (left := end - time.monotonic()) > 0 and (want is None or len(out) < want):
+            if select.select([self.fd], [], [], left)[0]:
                 out.append(deframe(os.read(self.fd, 1025)).decode("utf-8", "replace"))
         return out
     def post(self, cmd: str, body=None, seq=100):
@@ -56,12 +56,13 @@ class Ctl:
             t = f"POST {cmd} 1\r\nSeqNumber={seq}\r\nContentType=json\r\nContentLength={len(js)}\r\n\r\n{js}"
         self._write(t)
     def conn(self):
+        """Hello; MSI's service sends it twice and waits for the reply before any other command."""
         self.post("conn", seq=1); self.post("conn", seq=1)
-        time.sleep(0.1)
-        return self._read()
-    def brightness(self, v): self.post("brightness", {"value": int(v)}); return self._read(0.5)
-    def rotate(self, deg): self.post("rotate", {"degree": int(deg)}); return self._read(0.5)
-    def extended(self, on=True): self.post("extendedDisplay", {"enable": on}, seq=110); return self._read(0.5)
+        return self._read(1.0, want=1)
+    # Like MSI's service, these don't wait for a reply.
+    def brightness(self, v): self.post("brightness", {"value": int(v)})
+    def rotate(self, deg): self.post("rotate", {"degree": int(deg)})
+    def extended(self, on=True): self.post("extendedDisplay", {"enable": on}, seq=110)
     def close(self): os.close(self.fd)
 
 _lock = threading.Lock()
@@ -88,11 +89,11 @@ def parse_info(replies):
 
 if __name__ == "__main__":
     c = Ctl()
-    cmd = sys.argv[1] if len(sys.argv) > 1 else "conn"
-    if cmd == "conn": r = c.conn()
-    elif cmd == "extended": r = c.conn() + c.extended()
-    elif cmd == "animation": r = c.conn() + c.extended(False)
-    elif cmd == "brightness": r = c.brightness(sys.argv[2])
-    elif cmd == "rotate": r = c.rotate(sys.argv[2])
-    else: raise SystemExit("usage: hidctl.py conn|extended|animation|brightness N|rotate DEG")
-    for x in r: print(repr(x))
+    cmd, args = (sys.argv[1] if len(sys.argv) > 1 else "conn"), sys.argv[2:]
+    actions = {"conn": lambda: None, "extended": c.extended, "animation": lambda: c.extended(False),
+               "brightness": lambda: c.brightness(args[0]), "rotate": lambda: c.rotate(args[0])}
+    if cmd not in actions or (cmd in ("brightness", "rotate") and not args):
+        raise SystemExit("usage: hidctl.py conn|extended|animation|brightness N|rotate DEG")
+    replies = c.conn()
+    actions[cmd]()
+    for x in replies + c._read(0.5): print(repr(x))

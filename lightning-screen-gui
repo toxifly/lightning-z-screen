@@ -43,7 +43,7 @@ class Window(Adw.ApplicationWindow):
         light.add_suffix(self.bright)
         now.add(light)
         page.add(now)
-        self.bright_due = None
+        self.bright_sending = self.bright_pending = False
         self.cli(["brightness"], self.got_brightness)
 
         # -- video ------------------------------------------------------------------------------
@@ -133,16 +133,20 @@ class Window(Adw.ApplicationWindow):
     def on_brightness(self, scale):
         if not scale.get_sensitive():
             return
-        if self.bright_due is None:                 # send at most every 0.3 s while dragging
-            self.bright_due = GLib.timeout_add(300, self.send_brightness)
+        if self.bright_sending:                     # while dragging: only the newest value, next
+            self.bright_pending = True
+        else:
+            self.send_brightness()
 
     def send_brightness(self):
-        self.bright_due = None
+        self.bright_sending, self.bright_pending = True, False
         def done(ok, out):
+            self.bright_sending = False
             if not ok:
                 self.toast(error_line(out, "Could not set the brightness"))
+            elif self.bright_pending:
+                self.send_brightness()
         self.cli(["brightness", str(int(self.bright.get_value()))], done)
-        return False
 
     def set_busy(self, busy):
         self.busy = busy
