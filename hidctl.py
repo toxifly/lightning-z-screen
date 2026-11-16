@@ -68,13 +68,15 @@ class Ctl:
 _lock = threading.Lock()
 
 def session(usb_frames=None, brightness=None):
-    """One exchange on the control channel: `conn`, then optionally switch between the frames sent
-    over USB (True) and the built-in animation (False), and set the brightness (0-100).
-    Returns the screen's info from the `conn` reply (Brightness, Degree, Version, ...) or {}."""
+    """One exchange on the control channel: optionally switch between the frames sent over USB
+    (True) and the built-in animation (False), and set the brightness (0-100).
+    Switching is preceded by `conn`, as MSI's service does; its reply (Brightness, Degree, ...) is
+    returned, else {}. Brightness alone skips it: the screen takes it straight away, while the
+    `conn` reply often takes over a second."""
     with _lock:
         c = Ctl()
         try:
-            info = parse_info(c.conn())
+            info = parse_info(c.conn()) if usb_frames is not None else {}
             if usb_frames is not None: c.extended(usb_frames)
             if brightness is not None: c.brightness(brightness)
             return info
