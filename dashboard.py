@@ -6,13 +6,15 @@ Renders a dashboard with Pillow and streams it as JPEG frames. Data sources:
   * hwmon k10temp + /proc/stat: CPU temperature and load
   * Thermal Grizzly WireView Pro II units (optional): per-connector power and per-pin current
 
-Usage: dashboard.py [--rotate 0|90|180|270] [--fps 2] [--wireview DEV ...] [--preview out.png]
+It can also show a web page or a video instead (see modes.py); switch with lightning-screen.
+
+Usage: dashboard.py [--rotate 0|90|180|270] [--fps 2] [--wireview NAME=DEV ...] [--preview out.png]
 """
-import argparse, collections, glob, os, sys, threading, time
+import argparse, collections, glob, io, os, sys, threading, time
 from PIL import Image, ImageDraw, ImageFont
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-import aicast  # noqa: E402
+import aicast, control, hidctl, modes  # noqa: E402
 
 # ---- palette (dataviz reference palette, dark mode) -------------------------------------------
 SURFACE, CARD, TRACK = "#1a1a19", "#232321", "#383835"
@@ -91,13 +93,11 @@ class WireViews:
     """Background reader; the WireView is a serial device, so poll gently (once a second)."""
     def __init__(self, devs):
         self.devs, self.data = devs, {}
-        self.ok = False
         try:
             import wvread
-            self.wv = wvread
-            self.ok = True
         except ImportError:
             return
+        self.wv = wvread
         threading.Thread(target=self._loop, daemon=True).start()
 
     def _loop(self):
@@ -250,43 +250,118 @@ def render(W, H, gpu_name, g, c, wv, hist):
     return img
 
 
+class Dashboard:
+    """The GPU monitor as a screen mode: renders a frame every 1/fps seconds."""
+    done = False
+
+    def __init__(self, gpu, cpu, wv, hist, w, h, rotate, fps, quality):
+        self.gpu, self.cpu, self.wv, self.hist = gpu, cpu, wv, hist
+        self.size, self.rotate, self.period, self.quality = (w, h), rotate, 1.0 / fps, quality
+        self.due = time.monotonic()
+
+    def image(self):
+        g, c = self.gpu.read(), self.cpu.read()
+        self.hist["power"].append(g["power"]); self.hist["temp"].append(g["temp"])
+        W, H = self.size[::-1] if self.rotate in (90, 270) else self.size
+        img = render(W, H, self.gpu.name, g, c, dict(self.wv.data) if self.wv else {}, self.hist)
+        return img.rotate(-self.rotate, expand=True) if self.rotate else img
+
+    def next(self, timeout):
+        time.sleep(max(0.0, self.due - time.monotonic()))
+        self.due = max(self.due + self.period, time.monotonic())
+        b = io.BytesIO()
+        self.image().convert("RGB").save(b, "JPEG", quality=self.quality)
+        return b.getvalue()
+
+    def close(self):
+        pass
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--rotate", type=int, default=0, choices=[0, 90, 180, 270])
-    ap.add_argument("--fps", type=float, default=2.0)
+    ap.add_argument("--fps", type=float, default=2.0, help="dashboard frame rate")
+    ap.add_argument("--web-fps", type=float, default=10.0, help="maximum frame rate in web mode")
+    ap.add_argument("--video-fps", type=int, default=30, help="maximum frame rate in video mode")
     ap.add_argument("--quality", type=int, default=85)
     ap.add_argument("--wireview", nargs="*", default=["a=/dev/wireview-pro2-a", "b=/dev/wireview-pro2-b"],
                     help="NAME=DEVICE pairs; pass with no values to disable")
-    ap.add_argument("--preview", help="render one frame to this PNG and exit (no display needed)")
+    ap.add_argument("--control", default=os.path.join(os.environ["RUNTIME_DIRECTORY"], "control.sock")
+                    if os.environ.get("RUNTIME_DIRECTORY") else None,
+                    help="Unix socket for lightning-screen (mode switching); default: none outside systemd")
+    ap.add_argument("--control-users", nargs="*", default=[], metavar="USER",
+                    help="users allowed to switch modes (root and the service user always are)")
+    ap.add_argument("--preview", help="render one dashboard frame to this PNG and exit (no display needed)")
     a = ap.parse_args()
 
+    W, H = 1280, 800                      # panel size; checked against the device when it connects
     gpu, cpu = Gpu(), Cpu()
     wv = WireViews([tuple(x.split("=", 1)) for x in a.wireview]) if a.wireview else None
     hist = dict(power=collections.deque(maxlen=HIST), temp=collections.deque(maxlen=HIST))
-
-    def frame(W, H):
-        g, c = gpu.read(), cpu.read()
-        hist["power"].append(g["power"]); hist["temp"].append(g["temp"])
-        img = render(W, H, gpu.name, g, c, dict(wv.data) if wv else {}, hist)
-        return img.rotate(-a.rotate, expand=True) if a.rotate else img
+    dash = Dashboard(gpu, cpu, wv, hist, W, H, a.rotate, a.fps, a.quality)
 
     if a.preview:
         time.sleep(1.5)  # let CPU load / WireView get a sample
-        frame(1280, 800).save(a.preview)
+        dash.image().save(a.preview)
         print("wrote", a.preview)
         return
 
-    period = 1.0 / a.fps
+    cache = os.environ.get("CACHE_DIRECTORY")
+
+    def make(req, fd):
+        m = req.get("mode")
+        if m == "dashboard":
+            return dash
+        if m == "web":
+            if not str(req.get("url", "")).startswith(("http://", "https://")):
+                raise ValueError("web mode needs an http(s) URL")
+            prof = os.path.join(cache, "browser") if cache else None
+            return modes.WebPage(req["url"], W, H, a.rotate, a.quality, profile_dir=prof)
+        if m == "video":
+            if req.get("file"):                  # the service's own copy of a startup video
+                fd = os.open(os.path.join(os.environ.get("STATE_DIRECTORY", ""), req["file"]), os.O_RDONLY)
+                try: return make(dict(req, file=None), fd)
+                finally: os.close(fd)            # ffmpeg has its own copy by now
+            url = req.get("url") or req.get("page")
+            if fd is None and not str(url).startswith(("http://", "https://", "rtsp://", "rtmp://")):
+                raise ValueError("video mode needs a file or a network URL")
+            if fd is None and not req.get("url"):
+                url = modes.resolve(url)         # a remembered page link: get a fresh stream URL
+            return modes.Video(url, W, H, a.rotate, a.video_fps, a.quality,
+                               loop=bool(req.get("loop")), fill=bool(req.get("fill")), fd=fd)
+        raise ValueError(f"unknown mode {m!r}")
+
+    ctl = control.Controller(make, os.environ.get("STATE_DIRECTORY"))
+    ctl.restore()
+    if a.control:
+        ctl.serve(a.control, a.control_users)
+
+    last, sent = None, 0.0
     while True:
         scr = aicast.Screen()
         try:
             scr.open()
-            W, H = (scr.h, scr.w) if a.rotate in (90, 270) else (scr.w, scr.h)
             print(f"display connected: {scr.w}x{scr.h}", flush=True)
+            try:
+                hidctl.show_usb_frames()          # leave the built-in animation (after power-on)
+            except Exception as e:
+                print(f"control channel: {e}", flush=True)
+            if (scr.w, scr.h) != (W, H):
+                print(f"warning: panel is {scr.w}x{scr.h}, frames are {W}x{H}", flush=True)
+            if last:
+                scr.send_jpeg(last)
             while True:
+                mode = ctl.current()
+                jpg = mode.next(1.0)
+                if jpg:
+                    last = jpg
+                elif not last or time.monotonic() - sent < 2:
+                    continue                     # nothing new; repeat the last frame every 2 s
                 t0 = time.monotonic()
-                scr.send_image(frame(W, H), quality=a.quality)
-                time.sleep(max(0.0, period - (time.monotonic() - t0)))
+                scr.send_jpeg(last)
+                sent = time.monotonic()
+                if isinstance(mode, modes.WebPage):  # the browser is paced by our frame acks
+                    time.sleep(max(0.0, 1.0 / a.web_fps - (sent - t0)))
         except KeyboardInterrupt:
             scr.close()
             return

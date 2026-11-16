@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=Lightning Screen
+Comment=Play a video or show a web page on the RTX 5090 Lightning Z screen
+Exec=lightning-screen-gui
+Icon=video-display
+Terminal=false
+Categories=AudioVideo;Video;
+Keywords=MSI;Lightning;GPU;screen;YouTube;video;
+StartupWMClass=io.github.toxifly.LightningScreen

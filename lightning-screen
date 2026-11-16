@@ -1,0 +1,89 @@
+#!/usr/bin/python3 -I
+"""Switch what the Lightning Z screen shows.
+
+  lightning-screen                         show the current mode
+  lightning-screen dashboard               the GPU monitor (default)
+  lightning-screen web URL                 a live web page, kept across restarts
+  lightning-screen video FILE|URL [--loop] [--fill] [--startup]
+                                           play a video (no sound), then return to the previous mode;
+                                           --startup loops it and shows it again after every restart
+
+Local video files are opened by this command and handed to the service, so the service never
+needs access to your home directory. YouTube and similar pages are resolved with yt-dlp, if it
+is installed.
+"""
+import argparse, json, os, shutil, socket, subprocess, sys
+
+SOCK = os.environ.get("LIGHTNING_SCREEN_SOCKET", "/run/lightning-display/control.sock")
+
+
+def ask(req, fd=None):
+    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    try:
+        s.connect(SOCK)
+    except OSError as e:
+        sys.exit(f"cannot reach the screen service at {SOCK}: {e.strerror} "
+                 "(is lightning-display.service running?)")
+    with s:
+        msg = json.dumps(req).encode() + b"\n"
+        if fd is None:
+            s.sendall(msg)
+        else:
+            socket.send_fds(s, [msg], [fd])
+        data = b""
+        while not data.endswith(b"\n") and (chunk := s.recv(65536)):
+            data += chunk
+    r = json.loads(data or b'{"ok": false, "error": "no answer"}')
+    if not r.pop("ok"):
+        sys.exit(f"error: {r.get('error')}")
+    return r
+
+
+def resolve(url):
+    """Turn a video page URL (YouTube, ...) into (stream URL, title) with yt-dlp, if available."""
+    if not shutil.which("yt-dlp"):
+        return url, url
+    p = subprocess.run(["yt-dlp", "-q", "--no-warnings", "--no-playlist", "-f", "bv*[height<=1080]/b[height<=1080]/b",
+                        "--print", "title", "--print", "urls", url], capture_output=True, text=True)
+    out = p.stdout.splitlines()
+    if p.returncode or len(out) < 2:
+        print("yt-dlp could not resolve it; passing the URL to ffmpeg as is", file=sys.stderr)
+        return url, url
+    return out[1], out[0]
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = ap.add_subparsers(dest="mode")
+    sub.add_parser("status")
+    sub.add_parser("dashboard")
+    sub.add_parser("web").add_argument("url")
+    v = sub.add_parser("video")
+    v.add_argument("source", help="video file, or a stream / video page URL")
+    v.add_argument("--loop", action="store_true", help="repeat until another mode is chosen")
+    v.add_argument("--fill", action="store_true", help="crop to fill the screen instead of letterboxing")
+    v.add_argument("--startup", action="store_true",
+                   help="loop it, and show it again after restarts (until another mode is chosen)")
+    a = ap.parse_args()
+
+    if a.mode in (None, "status"):
+        r = ask({"mode": "status"})
+        what = r.get("name") or r.get("url")
+        print(r["mode"] + (f" {what}" if what else "") + (" (on startup)" if r.get("startup") else ""))
+    elif a.mode == "dashboard":
+        ask({"mode": "dashboard"})
+    elif a.mode == "web":
+        url = a.url if "://" in a.url else "https://" + a.url
+        ask({"mode": "web", "url": url})
+    elif a.mode == "video":
+        req = {"mode": "video", "loop": a.loop, "fill": a.fill, "startup": a.startup}
+        if os.path.exists(a.source):
+            fd = os.open(a.source, os.O_RDONLY)
+            ask(dict(req, name=os.path.basename(a.source)), fd)
+        else:
+            url, title = resolve(a.source)
+            ask(dict(req, url=url, name=title, page=a.source))
+
+
+if __name__ == "__main__":
+    main()

@@ -4,6 +4,9 @@
 Frame (BYProtocol_x64.dll protocol_format): 0x5A | len16be(n+5) | payload | sum8(len16+payload) | 0x5A,
 then bytes between the delimiters are escaped 0x5A->5B 01, 0x5B->5B 02. Sent as one 1024-byte report (ID 0).
 Payload is HTTP-like text, e.g. "POST brightness 1\r\nSeqNumber=100\r\nContentType=json\r\nContentLength=N\r\n\r\n{json}".
+
+After power-on the screen plays its built-in animation; `conn` + `extendedDisplay` (what MSI's service
+sends whenever it finds the screen) switch it to showing the frames sent over USB.
 """
 import glob, json, os, select, sys, time
 
@@ -58,6 +61,15 @@ class Ctl:
     def brightness(self, v): self.post("brightness", {"value": int(v)}); return self._read(0.5)
     def rotate(self, deg): self.post("rotate", {"degree": int(deg)}); return self._read(0.5)
     def extended(self): self.post("extendedDisplay", {"enable": True}, seq=110); return self._read(0.5)
+    def close(self): os.close(self.fd)
+
+def show_usb_frames():
+    """Switch the screen from its built-in animation to the USB picture (needed after power-on)."""
+    c = Ctl()
+    try:
+        c.conn(); c.extended()
+    finally:
+        c.close()
 
 if __name__ == "__main__":
     c = Ctl()

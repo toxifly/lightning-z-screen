@@ -1,12 +1,20 @@
 [Unit]
-Description=MSI RTX 5090 Lightning Z screen: GPU monitor
+Description=MSI RTX 5090 Lightning Z screen: GPU monitor, web page or video
 After=systemd-udev-settle.service nvidia-persistenced.service
 
 [Service]
 User=lightning-display
 Group=lightning-display
 SupplementaryGroups=dialout
-ExecStart=/opt/lightning-display/.venv/bin/python -I /opt/lightning-display/dashboard.py
+# CONTROL_USERS: who may switch modes with lightning-screen (written by install.sh)
+EnvironmentFile=-/etc/default/lightning-display
+ExecStart=/opt/lightning-display/.venv/bin/python -I /opt/lightning-display/dashboard.py --control-users $CONTROL_USERS
+# control socket, remembered mode, and the headless browser's profile (web mode)
+RuntimeDirectory=lightning-display
+RuntimeDirectoryMode=0755
+StateDirectory=lightning-display
+CacheDirectory=lightning-display
+Environment=HOME=/var/cache/lightning-display
 Restart=always
 RestartSec=5
 Nice=10

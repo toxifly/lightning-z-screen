@@ -1,0 +1,191 @@
+#!/usr/bin/python3 -I
+"""Small GNOME app for the Lightning Z screen: play a video (YouTube or any link, or a file),
+show a web page, or go back to the GPU dashboard. It drives the `lightning-screen` command."""
+import os, shutil, sys
+import gi
+gi.require_version("Gtk", "4.0")
+gi.require_version("Adw", "1")
+from gi.repository import Adw, Gdk, Gio, GLib, Gtk
+
+APP_ID = "io.github.toxifly.LightningScreen"
+CLI = shutil.which("lightning-screen") or os.path.join(os.path.dirname(os.path.realpath(__file__)), "lightning-screen")
+VIDEO_TYPES = ["video/*", "image/gif"]
+
+
+class Window(Adw.ApplicationWindow):
+    def __init__(self, app):
+        super().__init__(application=app, title="Lightning Screen", default_width=520)
+        self.busy = False
+        self.toasts = Adw.ToastOverlay()
+        view = Adw.ToolbarView()
+        view.add_top_bar(Adw.HeaderBar())
+        page = Adw.PreferencesPage()
+        view.set_content(page)
+        self.toasts.set_child(view)
+        self.set_content(self.toasts)
+
+        # -- now showing ------------------------------------------------------------------------
+        now = Adw.PreferencesGroup(title="On the card's screen")
+        self.status = Adw.ActionRow(title="Now showing", subtitle="…")
+        self.status.add_css_class("property")
+        self.spinner = Adw.Spinner(visible=False)
+        self.status.add_suffix(self.spinner)
+        self.stop = Gtk.Button(label="GPU Dashboard", valign=Gtk.Align.CENTER, tooltip_text="Show the GPU monitor")
+        self.stop.connect("clicked", lambda *_: self.run(["dashboard"], "Showing the GPU dashboard"))
+        self.status.add_suffix(self.stop)
+        now.add(self.status)
+        page.add(now)
+
+        # -- video ------------------------------------------------------------------------------
+        vid = Adw.PreferencesGroup(title="Video", description="YouTube or another video link, or a file. No sound.")
+        self.vurl = Adw.EntryRow(title="Video link", show_apply_button=True)
+        self.vurl.connect("apply", lambda *_: self.play_url())
+        self.vurl.connect("entry-activated", lambda *_: self.play_url())
+        paste = Gtk.Button(icon_name="edit-paste-symbolic", valign=Gtk.Align.CENTER, tooltip_text="Paste and play")
+        paste.add_css_class("flat")
+        paste.connect("clicked", self.paste_and_play)
+        self.vurl.add_suffix(paste)
+        vid.add(self.vurl)
+        pick = Adw.ButtonRow(title="Play a File…", start_icon_name="folder-videos-symbolic")
+        pick.connect("activated", self.choose_file)
+        vid.add(pick)
+        self.loop = Adw.SwitchRow(title="Repeat", subtitle="Keep playing until you choose something else")
+        self.fill = Adw.SwitchRow(title="Fill the screen", subtitle="Crop the edges instead of adding black bars")
+        self.startup = Adw.SwitchRow(title="Play on Startup",
+                                     subtitle="Repeat it, and show it again after every restart")
+        self.startup.connect("notify::active", lambda *_: self.loop.set_sensitive(not self.startup.get_active()))
+        vid.add(self.loop)
+        vid.add(self.fill)
+        vid.add(self.startup)
+        page.add(vid)
+
+        # -- web page ---------------------------------------------------------------------------
+        web = Adw.PreferencesGroup(title="Web Page", description="Stays on the screen after restarts.")
+        self.wurl = Adw.EntryRow(title="Address", show_apply_button=True)
+        self.wurl.connect("apply", lambda *_: self.show_web())
+        self.wurl.connect("entry-activated", lambda *_: self.show_web())
+        web.add(self.wurl)
+        page.add(web)
+
+        # drop a video file or a link anywhere on the window
+        drop = Gtk.DropTarget.new(Gdk.FileList, Gdk.DragAction.COPY)
+        drop.set_gtypes([Gdk.FileList, str])
+        drop.connect("drop", self.on_drop)
+        self.add_controller(drop)
+
+        self.refresh()
+        GLib.timeout_add_seconds(3, self.refresh)
+
+    # -- talking to the service -------------------------------------------------------------------
+    def run(self, args, done_msg=None, on_ok=None):
+        if self.busy:
+            return
+        self.set_busy(True)
+        proc = Gio.Subprocess.new([CLI, *args], Gio.SubprocessFlags.STDOUT_PIPE | Gio.SubprocessFlags.STDERR_MERGE)
+
+        def finished(p, res):
+            _, out, _ = p.communicate_utf8_finish(res)
+            self.set_busy(False)
+            if p.get_successful():
+                if done_msg: self.toast(done_msg)
+                if on_ok: on_ok()
+            else:
+                lines = [l for l in (out or "").strip().splitlines() if l]
+                self.toast(lines[-1].removeprefix("error: ") if lines else "Something went wrong")
+            self.refresh()
+        proc.communicate_utf8_async(None, None, finished)
+
+    def refresh(self):
+        def finished(p, res):
+            try:
+                _, out, _ = p.communicate_utf8_finish(res)
+            except GLib.Error:
+                return
+            if not p.get_successful():
+                self.status.set_subtitle("Screen service not running")
+                return
+            mode, _, what = (out or "").strip().partition(" ")
+            label = {"dashboard": "GPU dashboard", "web": "Web page", "video": "Video"}.get(mode, mode)
+            self.status.set_subtitle(GLib.markup_escape_text(f"{label}: {what}" if what else label))
+            self.stop.set_visible(mode != "dashboard")
+        p = Gio.Subprocess.new([CLI, "status"], Gio.SubprocessFlags.STDOUT_PIPE | Gio.SubprocessFlags.STDERR_MERGE)
+        p.communicate_utf8_async(None, None, finished)
+        return True
+
+    def set_busy(self, busy):
+        self.busy = busy
+        self.spinner.set_visible(busy)
+        if busy:
+            self.status.set_subtitle("Starting…")
+
+    def toast(self, msg):
+        self.toasts.add_toast(Adw.Toast(title=GLib.markup_escape_text(msg), timeout=4))
+
+    def video_args(self, source):
+        flags = {"--loop": self.loop, "--fill": self.fill, "--startup": self.startup}
+        return ["video", source] + [f for f, row in flags.items() if row.get_active()]
+
+    # -- actions -----------------------------------------------------------------------------------
+    def play(self, source):
+        source = source.strip()
+        if source:
+            self.run(self.video_args(source), "Playing on the card's screen")
+
+    def play_url(self):
+        self.play(self.vurl.get_text())
+
+    def paste_and_play(self, *_):
+        def got(cb, res):
+            text = cb.read_text_finish(res)
+            if text:
+                self.vurl.set_text(text.strip())
+                self.play_url()
+        self.get_clipboard().read_text_async(None, got)
+
+    def choose_file(self, *_):
+        f = Gtk.FileFilter(name="Videos")
+        for t in VIDEO_TYPES: f.add_mime_type(t)
+        filters = Gio.ListStore.new(Gtk.FileFilter); filters.append(f)
+        dlg = Gtk.FileDialog(title="Play a Video", filters=filters)
+        videos = GLib.get_user_special_dir(GLib.UserDirectory.DIRECTORY_VIDEOS)
+        if videos and os.path.isdir(videos):
+            dlg.set_initial_folder(Gio.File.new_for_path(videos))
+
+        def chosen(d, res):
+            try:
+                path = d.open_finish(res).get_path()
+            except GLib.Error:
+                return                              # cancelled
+            if path:
+                self.play(path)
+        dlg.open(self, None, chosen)
+
+    def show_web(self):
+        url = self.wurl.get_text().strip()
+        if url:
+            self.run(["web", url], "Showing the page on the card's screen")
+
+    def on_drop(self, _target, value, _x, _y):
+        if isinstance(value, Gdk.FileList):
+            files = [f.get_path() for f in value.get_files() if f.get_path()]
+            if files:
+                self.play(files[0])
+                return True
+            return False
+        if isinstance(value, str) and value.strip():
+            self.vurl.set_text(value.strip())
+            self.play_url()
+            return True
+        return False
+
+
+class App(Adw.Application):
+    def __init__(self):
+        super().__init__(application_id=APP_ID, flags=Gio.ApplicationFlags.DEFAULT_FLAGS)
+
+    def do_activate(self):
+        (self.get_active_window() or Window(self)).present()
+
+
+if __name__ == "__main__":
+    sys.exit(App().run(sys.argv))

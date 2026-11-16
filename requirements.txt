@@ -2,3 +2,4 @@ pyusb
 pillow
 cryptography
 nvidia-ml-py
+yt-dlp
