@@ -296,7 +296,7 @@ class Dashboard:
     def claude_frame(self):
         g, c = self.read()
         W, H = self._wh()
-        return claude_board.render(W, H, self.board.snapshot(), g, c).convert("RGB")
+        return claude_board.render(W, H, self.board.snapshot(), g, c, tmux=self.board.layout()).convert("RGB")
 
     def image(self):
         img = self.gpu_frame()

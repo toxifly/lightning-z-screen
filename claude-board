@@ -147,23 +147,42 @@ def alive(pid):
 
 
 def tmux():
-    """{pane_id: (session, window, pane, title)}, {focused pane ids}"""
+    """{pane_id: (session, window, pane, title)}, {focused pane ids}, [window layouts]"""
     def run(*args):
         try:
             return subprocess.run(["tmux", *args], capture_output=True, text=True, timeout=2).stdout
         except (OSError, subprocess.TimeoutExpired):
             return ""
-    panes = {}
-    for line in run("list-panes", "-a", "-F", "#{pane_id}\t#{session_name}\t#{window_index}\t#{pane_index}\t#{pane_title}").splitlines():
-        p = line.split("\t", 4)
-        if len(p) == 5:
-            panes[p[0]] = tuple(p[1:])
+    panes, wins = {}, {}
+    fmt = "\t".join("#{%s}" % k for k in (
+        "pane_id", "session_name", "window_index", "pane_index", "pane_title", "pane_left", "pane_top",
+        "pane_width", "pane_height", "window_width", "window_height", "pane_current_command",
+        "window_name", "window_active", "session_attached"))
+    for line in run("list-panes", "-a", "-F", fmt).splitlines():
+        p = line.split("\t")
+        if len(p) != 15:
+            continue
+        pid, sess, win, pn, title, x, y, w, h, ww, wh, cmd, wname, wact, attached = p
+        panes[pid] = (sess, win, pn, title)
+        pre = "" if sess == "main" else sess + ":"
+        key = (sess, win)
+        if key not in wins:
+            wins[key] = {"win": pre + win, "name": wname[:40], "active": wact == "1" and attached != "0",
+                         "w": int(ww), "h": int(wh), "panes": []}
+        wins[key]["panes"].append({"pos": f"{pre}{win}.{pn}", "id": pid, "x": int(x), "y": int(y),
+                                   "w": int(w), "h": int(h), "cmd": cmd[:24]})
     focused = set()
     for line in run("list-clients", "-F", "#{client_flags}\t#{pane_id}").splitlines():
         flags, _, pane = line.partition("\t")
         if "focused" in flags.split(","):
             focused.add(pane)
-    return panes, focused
+    layout = []
+    for key in sorted(wins, key=lambda k: (k[0] != "main", k[0], int(k[1]) if k[1].isdigit() else 0)):
+        w = wins[key]
+        for pn in w["panes"]:
+            pn["focus"] = pn.pop("id") in focused
+        layout.append(w)
+    return panes, focused, layout[:8]
 
 
 _titles = {}
@@ -206,7 +225,7 @@ def run():
     focus_start, last_sent, last_payload = {}, 0.0, None
     while True:
         now = time.time()
-        panes, focused = tmux()
+        panes, focused, layout = tmux()
         for p in list(focus_start):
             if p not in focused:
                 del focus_start[p]
@@ -248,7 +267,7 @@ def run():
                         "state": state, "since": s.get("since", now), "msg": s.get("msg", "")})
 
         out.sort(key=lambda x: x["id"])
-        payload = json.dumps({"mode": "claude-status", "sessions": out})
+        payload = json.dumps({"mode": "claude-status", "sessions": out, "tmux": layout})
         if payload != last_payload or now - last_sent >= RESEND:
             if send(payload):
                 last_payload, last_sent = payload, now

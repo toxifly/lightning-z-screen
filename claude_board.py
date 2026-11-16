@@ -11,8 +11,8 @@ state: "needs"   waiting for an answer or a permission
        "working" busy
        "idle"    finished and seen
 
-The GPU dashboard turns into this view by itself while any session is "needs" or "done" (the GPU
-numbers shrink to a strip in the header); `lightning-screen claude` keeps it on screen.
+The GPU dashboard turns into this view by itself while any session is working, needs an answer or
+is done (the GPU numbers shrink to a strip in the header); `lightning-screen claude` keeps it on screen.
 """
 import functools, math, os, threading, time
 from PIL import Image, ImageDraw, ImageFilter, ImageFont
@@ -41,9 +41,9 @@ class Board:
     STATES = ("needs", "done", "working", "idle")
 
     def __init__(self):
-        self.lock, self.sessions, self.at = threading.Lock(), [], 0.0
+        self.lock, self.sessions, self.windows, self.at = threading.Lock(), [], [], 0.0
 
-    def update(self, sessions):
+    def update(self, sessions, tmux=()):
         clean = []
         for s in list(sessions)[:60]:
             if not isinstance(s, dict) or s.get("state") not in self.STATES:
@@ -52,12 +52,27 @@ class Board:
                           "project": str(s.get("project") or "")[:80], "pos": str(s.get("pos") or "")[:24],
                           "where": str(s.get("where") or "")[:16], "state": s["state"],
                           "msg": str(s.get("msg") or "")[:160], "since": _num(s.get("since"))})
+        windows = []
+        for w in list(tmux or ())[:8]:
+            try:
+                panes = [{"pos": str(p["pos"])[:24], "x": int(p["x"]), "y": int(p["y"]), "w": max(1, int(p["w"])),
+                          "h": max(1, int(p["h"])), "cmd": str(p.get("cmd") or "")[:24], "focus": bool(p.get("focus"))}
+                         for p in list(w["panes"])[:16]]
+                windows.append({"win": str(w["win"])[:24], "name": str(w.get("name") or "")[:40],
+                                "active": bool(w.get("active")), "w": max(1, int(w["w"])), "h": max(1, int(w["h"])),
+                                "panes": panes})
+            except (KeyError, TypeError, ValueError):
+                continue
         with self.lock:
-            self.sessions, self.at = clean, time.monotonic()
+            self.sessions, self.windows, self.at = clean, windows, time.monotonic()
 
     def snapshot(self):
         with self.lock:
             return [] if time.monotonic() - self.at > STALE else list(self.sessions)
+
+    def layout(self):
+        with self.lock:
+            return [] if time.monotonic() - self.at > STALE else list(self.windows)
 
     def attention(self):
         return any(s["state"] in ("needs", "done") for s in self.snapshot())
@@ -260,82 +275,279 @@ def ordered(sessions):
 
 
 # ---- the full Claude view ---------------------------------------------------------------------
-def render(W, H, sessions, g, c, t=None):
-    """sessions as pushed by the agent; g, c: GPU and CPU readings of the dashboard (may be None)."""
+def render(W, H, sessions, g, c, t=None, tmux=None):
+    """sessions as pushed by the agent; g, c: GPU and CPU readings of the dashboard (may be None);
+    tmux: the window/pane layout pushed by the agent (drawn as a map when present)."""
     t = time.time() if t is None else t
     img = Image.new("RGBA", (W, H), BG + (255,))
     d = ImageDraw.Draw(img)
-    pad = 28
+    pad = 26
     ss = ordered(sessions)
-    att = [s for s in ss if s["state"] in ("needs", "done")]
-    rest = [s for s in ss if s["state"] not in ("needs", "done")]
-    busy = any(s["state"] == "working" for s in ss)
-
-    # header: spark + wordmark, GPU strip, clock
-    img.alpha_composite(spark(50, t, breathe=0.07 if busy else 0.0, spin=0.35 if busy else 0.08), (pad - 4, 18))
-    d.text((pad + 56, 20), "Claude", font=font("serif", 38, 500), fill=INK)
-    sub = f"{len(ss)} session{'s' if len(ss) != 1 else ''}" if ss else "no sessions"
-    d.text((pad + 56 + d.textlength("Claude", font=font("serif", 38, 500)) + 14, 36), sub,
-           font=font("sans", 19, 400), fill=MUTED)
-    clock = time.strftime("%H:%M")
-    fc = font("sans", 28, 500)
-    d.text((W - pad, 26), clock, font=fc, fill=INK2, anchor="ra")
-    x = W - pad - d.textlength(clock, font=fc) - 22
-    for label, val in reversed(_gpu_strip(g, c)):
-        fl, fv = font("sans", 16, 500), font("sans", 18, 600)
-        wl, wv = d.textlength(label, font=fl), d.textlength(val, font=fv)
-        pw = int(wl + wv + 34)
-        x -= pw
-        img.alpha_composite(rrect(pw, 36, 18, CARD), (int(x), 24))
-        d.text((x + 14, 42), label, font=fl, fill=MUTED, anchor="lm")
-        d.text((x + 20 + wl, 42), val, font=fv, fill=INK, anchor="lm")
-        x -= 10
-
-    y0, bottom = 100, H - 22
-    if not ss:
+    _header(img, d, W, pad, ss, g, c, t)
+    top, bottom = 104, H - 20
+    if not ss and not tmux:
         _empty(img, d, W, H, t)
         return img
-
-    # hero when nothing needs you
-    if not att:
-        hero_h = 150
-        img.alpha_composite(mascot(6, t, "idle"), (pad + 30, y0 + 22))
-        d.text((pad + 220, y0 + 30), "All caught up", font=font("serif", 40, 500), fill=INK)
-        n = sum(s["state"] == "working" for s in ss)
-        d.text((pad + 220, y0 + 86), f"{n} working · nothing needs you" if n else "Nothing needs you right now",
-               font=font("sans", 21, 400), fill=MUTED)
-        y0 += hero_h
-
-    # attention cards
-    gap = 14
-    row_h = 62 if len(ss) <= 6 else 54
-    card_h = 168 if len(att) <= 2 else (130 if len(att) <= 3 else 104)
-    rows_wanted = min(len(rest), 3)
-    space = bottom - y0 - ((34 + rows_wanted * (row_h + 8)) if rows_wanted else 0)
-    n_cards = min(len(att), max(1, (space + gap) // (card_h + gap))) if att else 0
-    y = y0
-    for s in att[:n_cards]:
-        _card(img, d, pad, y, W - 2 * pad, card_h, s, t)
-        y += card_h + gap
-    hidden = len(att) - n_cards
-
-    # other sessions
-    if rest:
-        if att:
-            y += 6
-            spaced(d, (pad + 4, y), "IN PROGRESS" if any(s["state"] == "working" for s in rest) else "OTHER SESSIONS",
-                   font("sans", 15, 700), MUTED, track=2.2)
-            y += 28
-        n_rows = max(0, min(len(rest), (bottom - y + 8) // (row_h + 8)))
-        if n_rows < len(rest) and n_rows:
-            n_rows -= 1
-        for s in rest[:n_rows]:
-            _row(img, d, pad, y, W - 2 * pad, row_h, s, t)
-            y += row_h + 8
-        hidden += len(rest) - n_rows
-    if hidden > 0:
-        d.text((W // 2, min(y + 4, bottom - 24)), f"+ {hidden} more", font=font("sans", 18, 500), fill=MUTED, anchor="ma")
+    by_pos = {s["pos"]: s for s in ss if s["where"] == "tmux" and s["pos"]}
+    lx = pad
+    if tmux:
+        mw = int((W - 2 * pad) * 0.56)
+        _map(img, d, pad, top, mw, bottom - top, tmux, by_pos, t)
+        lx = pad + mw + 22
+    shown = [s for s in ss if s["state"] != "idle" or s["pos"] not in by_pos or not tmux]
+    _list(img, d, lx, top, W - pad - lx, bottom - top, shown, ss, t)
     return img
+
+
+def _header(img, d, W, pad, ss, g, c, t):
+    busy = any(s["state"] == "working" for s in ss)
+    img.alpha_composite(spark(58, t, breathe=0.07 if busy else 0.0, spin=0.35 if busy else 0.08), (pad - 4, 20))
+    fw = font("serif", 48, 600)
+    d.text((pad + 64, 20), "Claude", font=fw, fill=INK)
+    x = pad + 64 + d.textlength("Claude", font=fw) + 22
+    n = {k: sum(s["state"] == k for s in ss) for k in ORDER}
+    parts = [(f"{n['needs']} need{'s' if n['needs'] == 1 else ''} you", CLAUDE) if n["needs"] else None,
+             (f"{n['working']} working", INK2) if n["working"] else None,
+             (f"{n['done']} done", DONE) if n["done"] else None]
+    parts = [p for p in parts if p] or [("all quiet" if ss else "no sessions", MUTED)]
+    fs = font("sans", 24, 600)
+    for i, (txt, col) in enumerate(parts):
+        if i:
+            d.text((x, 48), "·", font=fs, fill=MUTED, anchor="lm"); x += 18
+        d.text((x, 48), txt, font=fs, fill=col, anchor="lm")
+        x += d.textlength(txt, font=fs) + 14
+    clock = time.strftime("%H:%M")
+    fc = font("sans", 38, 600)
+    d.text((W - pad, 48), clock, font=fc, fill=INK, anchor="rm")
+    x = W - pad - d.textlength(clock, font=fc) - 22
+    fl, fv = font("sans", 18, 500), font("sans", 22, 650)
+    for label, val in reversed(_gpu_strip(g, c)):
+        wl = d.textlength(label, font=fl) + (8 if label else 0)
+        wv = d.textlength(val, font=fv)
+        pw = int(wl + wv + 30)
+        if x - pw < 560:
+            break
+        x -= pw
+        img.alpha_composite(rrect(pw, 42, 21, CARD), (int(x), 27))
+        if label:
+            d.text((x + 15, 48), label, font=fl, fill=MUTED, anchor="lm")
+        d.text((x + 15 + wl, 48), val, font=fv, fill=INK, anchor="lm")
+        x -= 10
+
+
+def mix(a, b, k):
+    return tuple(int(a[i] + (b[i] - a[i]) * k) for i in range(3))
+
+
+STATE_COL = {"needs": CLAUDE, "done": DONE, "working": CLAUDE, "idle": MUTED}
+STATE_LABEL = {"needs": "NEEDS YOU", "done": "DONE", "working": "WORKING", "idle": "IDLE"}
+
+
+def wrap(d, text, f, maxw, lines):
+    """Up to `lines` lines of text, the last one shortened with an ellipsis."""
+    words, out = text.split(), []
+    while words and len(out) < lines:
+        line = words.pop(0)
+        while words and d.textlength(line + " " + words[0], font=f) <= maxw:
+            line += " " + words.pop(0)
+        if len(out) == lines - 1 and words:
+            line = fit(d, line + " " + " ".join(words), f, maxw)
+            words = []
+        out.append(fit(d, line, f, maxw))
+    return out
+
+
+def comet(img, x, y, w, h, t, color, period=2.4):
+    """A bright dot running around a tile's edge with a fading tail (the "working" animation)."""
+    layer = Image.new("RGBA", (w + 16, h + 16), (0, 0, 0, 0))
+    ld = ImageDraw.Draw(layer)
+    per = 2 * (w + h)
+    N = 46
+    for i in range(N):
+        p = ((t / period) % 1.0 * per - i * per * 0.0045) % per
+        if p < w: px, py = p, 0
+        elif p < w + h: px, py = w, p - w
+        elif p < 2 * w + h: px, py = w - (p - w - h), h
+        else: px, py = 0, h - (p - 2 * w - h)
+        px, py = min(max(px, 1), w - 1) + 8, min(max(py, 1), h - 1) + 8
+        r = 3.6 * (1 - i / (N + 8))
+        ld.ellipse([px - r, py - r, px + r, py + r], fill=color + (int(255 * (1 - i / N) ** 1.5),))
+    img.alpha_composite(layer.filter(ImageFilter.GaussianBlur(1.2)), (x - 8, y - 8))
+
+
+def _map(img, d, x, y, w, h, windows, by_pos, t):
+    """The tmux windows, each with its panes laid out as on the terminal, coloured by state."""
+    head = 34
+    rows = [max(1, len({p["y"] for p in win["panes"]})) for win in windows]
+    gap = 14
+    avail = h - len(windows) * head - gap * (len(windows) - 1)
+    hs = [max(96, int(avail * r / sum(rows))) for r in rows]
+    while sum(hs) > avail and max(hs) > 96:
+        i = hs.index(max(hs)); hs[i] -= 1
+    cy = y
+    for win, wh in zip(windows, hs):
+        if cy + head + 60 > y + h:
+            break
+        wh = min(wh, y + h - cy - head)
+        lab = f"WINDOW {win['win']}"
+        lw = spaced(d, (x + 4, cy + 4), lab, font("sans", 17, 700), INK2 if win["active"] else MUTED, track=2.2)
+        if win["name"] and not win["name"][:1].isdigit():
+            d.text((x + 4 + lw + 12, cy + 2), fit(d, win["name"], font("sans", 19, 500), w - lw - 120),
+                   font=font("sans", 19, 500), fill=MUTED)
+        if win["active"]:
+            d.text((x + w - 4, cy + 3), "on screen", font=font("sans", 17, 500), fill=MUTED, anchor="ra")
+        sx, sy = w / win["w"], wh / win["h"]
+        for p in win["panes"]:
+            x0, y0 = x + p["x"] * sx, cy + head + p["y"] * sy
+            x1, y1 = x + min(win["w"], p["x"] + p["w"] + 1) * sx, cy + head + min(win["h"], p["y"] + p["h"] + 1) * sy
+            _tile(img, d, int(x0) + 3, int(y0) + 3, int(x1 - x0) - 6, int(y1 - y0) - 6, p, by_pos.get(p["pos"]), t)
+        cy += head + wh + gap
+
+
+def _tile(img, d, x, y, w, h, p, s, t):
+    now = time.time()
+    st = s["state"] if s else None
+    r = 18
+    if st is None:                                          # not a Claude pane
+        img.alpha_composite(rrect(w, h, r, (35, 34, 32), (52, 50, 46), 1), (x, y))
+        d.text((x + 18, y + 14), p["pos"], font=font("sans", 30, 700), fill=MUTED)
+        d.text((x + 18, y + 54), p["cmd"] or "shell", font=font("sans", 21, 500), fill=(110, 107, 99))
+        if p["focus"]:
+            _here(d, x, y, p["pos"])
+        return
+    col = STATE_COL[st]
+    if st == "needs":
+        level = 3 + round(4 * (0.5 + 0.5 * math.sin(t * 2 * math.pi / 1.8)))
+        img.alpha_composite(glow(w, h, r, CLAUDE, 12, level), (x - 24, y - 24))
+        fill = mix(BG, CLAUDE, 0.24)
+    elif st == "done":
+        fill = mix(BG, DONE, 0.17)
+    else:
+        fill = CARD_HI if st == "working" else CARD
+    img.alpha_composite(rrect(w, h, r, fill, col + ((200,) if st != "idle" else (60,)), 2), (x, y))
+    if st == "working":
+        comet(img, x, y, w, h, t + hash(s["id"]) % 10 * 0.23, CLAUDE)
+
+    # top: position + state label
+    d.text((x + 18, y + 12), p["pos"], font=font("sans", 32, 700), fill=INK if st != "idle" else INK2)
+    spaced(d, (x + w - 18, y + 22), STATE_LABEL[st], font("sans", 17, 700), col, track=2.0, anchor_right=True)
+    if p["focus"]:
+        _here(d, x, y, p["pos"])
+
+    # icon, bottom right
+    ic = int(min(h * 0.42, w * 0.3, 96))
+    icon_w = 0
+    if ic >= 34:
+        if st == "needs":
+            m = mascot(max(2, ic // 17), t + hash(s["id"]) % 7 * 0.13, "wave")
+        elif st == "done":
+            ring = int((t * 6) % 9) if now - s["since"] < 90 else 0
+            m = check_icon(ic, DONE, ring)
+        elif st == "working":
+            m = None
+            fsz = int(ic * 0.9)
+            d.text((x + w - 16 - fsz // 2, y + h - 14 - fsz // 2), spinner(t + hash(s["id"]) % 10 * 0.07),
+                   font=font("sym", fsz), fill=CLAUDE, anchor="mm")
+            icon_w = fsz
+        else:
+            m = mascot(max(2, ic // 20), t, "sleep" if now - s["since"] > 600 else "idle", color=(120, 116, 106))
+        if m is not None:
+            img.alpha_composite(m, (x + w - 14 - m.width, y + h - 12 - m.height))
+            icon_w = m.width
+
+    # title (wrapped) and time
+    title = s["title"] or s["project"] or "Claude session"
+    ft = font("serif", 27 if h >= 150 else 24, 600)
+    ty, lh = y + 58, (35 if h >= 150 else 31)
+    fwhen = font("sans", 20, 500)
+    when_y = y + h - 34
+    n_lines = max(0, min(3, (when_y - ty - 4) // lh))
+    if n_lines == 0 and h >= 70:                            # short tile: title beside the position
+        px = x + 18 + d.textlength(p["pos"], font=font("sans", 32, 700)) + 16
+        lbl = d.textlength(STATE_LABEL[st], font=font("sans", 17, 700)) + 2 * len(STATE_LABEL[st])
+        d.text((px, y + 18), fit(d, title, font("serif", 24, 600), x + w - 30 - lbl - px), font=font("serif", 24, 600),
+               fill=INK if st != "idle" else INK2)
+    else:
+        for i, line in enumerate(wrap(d, title, ft, w - 36 - (icon_w if i_overlaps(ty, lh, n_lines, y, h, ic) else 0), n_lines)):
+            d.text((x + 18, ty + i * lh), line, font=ft, fill=INK if st != "idle" else INK2)
+    when = {"needs": "waiting " + ago(s["since"], now), "done": ago(s["since"], now) + " ago",
+            "working": ago(s["since"], now), "idle": "idle " + ago(s["since"], now)}[st].replace("just now ago", "just now")
+    if h >= 70:
+        d.text((x + 18, when_y), fit(d, when + (f" · {s['project']}" if s["project"] else ""), fwhen, w - 50 - icon_w),
+               font=fwhen, fill=col if st in ("needs", "done") else MUTED)
+
+
+def i_overlaps(ty, lh, n, y, h, ic):
+    return ty + n * lh > y + h - 12 - ic * 1.0
+
+
+def _here(d, x, y, pos):
+    """Marks the pane that has the keyboard: a small dot after its position."""
+    px = x + 18 + d.textlength(pos, font=font("sans", 32, 700)) + 10
+    d.ellipse([px, y + 30, px + 10, y + 40], fill=INK)
+
+
+def _list(img, d, x, y, w, h, shown, ss, t):
+    """Sessions that need attention or are busy (and the ones outside tmux), large and readable."""
+    if not shown:                                           # nothing going on: a calm hero
+        m = mascot(7 if w > 600 else 6, t, "idle")
+        img.alpha_composite(m, (x + (w - m.width) // 2, y + h // 2 - m.height - 40))
+        d.text((x + w // 2, y + h // 2), "All caught up", font=font("serif", 42, 600), fill=INK, anchor="ma")
+        d.text((x + w // 2, y + h // 2 + 58), "Nothing needs you right now" if ss else "No Claude sessions yet",
+               font=font("sans", 22, 500), fill=MUTED, anchor="ma")
+        return
+    gap = 12
+    big = 128 if len(shown) <= 4 else 108
+    hs = [big if s["state"] in ("needs", "done") else big - 20 for s in shown]
+    n = len(shown)
+    while n and sum(hs[:n]) + gap * (n - 1) > h:
+        n -= 1
+    if n < len(shown) and n:
+        n -= 1 if sum(hs[:n]) + gap * n + 34 > h else 0
+    cy = y
+    for s, ih in zip(shown[:n], hs[:n]):
+        _item(img, d, x, cy, w, ih, s, t)
+        cy += ih + gap
+    if n < len(shown):
+        d.text((x + w // 2, cy + 2), f"+ {len(shown) - n} more", font=font("sans", 20, 600), fill=MUTED, anchor="ma")
+
+
+def _item(img, d, x, y, w, h, s, t):
+    st, now = s["state"], time.time()
+    col = STATE_COL[st]
+    if st == "needs":
+        level = 3 + round(4 * (0.5 + 0.5 * math.sin(t * 2 * math.pi / 1.8)))
+        img.alpha_composite(glow(w, h, 18, CLAUDE, 10, level), (x - 20, y - 20))
+    fill = {"needs": mix(BG, CLAUDE, 0.22), "done": mix(BG, DONE, 0.14)}.get(st, CARD)
+    img.alpha_composite(rrect(w, h, 18, fill), (x, y))
+    img.alpha_composite(rrect(6, h - 32, 3, col), (x + 12, y + 16))
+    cy = y + h // 2
+    # icon column
+    if st == "needs":
+        m = mascot(3, t + hash(s["id"]) % 7 * 0.13, "wave")
+        img.alpha_composite(m, (x + 30, cy - m.height // 2))
+    elif st == "done":
+        img.alpha_composite(check_icon(56, DONE, int((t * 6) % 9) if now - s["since"] < 90 else 0), (x + 28, cy - 28))
+    elif st == "working":
+        d.text((x + 56, cy), spinner(t + hash(s["id"]) % 10 * 0.07), font=font("sym", 40), fill=CLAUDE, anchor="mm")
+    else:
+        d.ellipse([x + 49, cy - 7, x + 63, cy + 7], fill=MUTED)
+    tx = x + 96
+    title = s["title"] or s["project"] or "Claude session"
+    ft = font("serif", 28, 600)
+    lines = wrap(d, title, ft, x + w - 20 - tx, 2 if h >= 120 else 1)
+    th = 36 * len(lines)
+    ty = cy - (th + 40) // 2
+    for i, line in enumerate(lines):
+        d.text((tx, ty + i * 36), line, font=ft, fill=INK)
+    my = ty + th + 6
+    cw = _chip(img, d, tx, my, place(s), col if st != "idle" else MUTED)
+    when = {"needs": "waiting " + ago(s["since"], now), "done": ago(s["since"], now) + " ago",
+            "working": "working " + ago(s["since"], now), "idle": "idle " + ago(s["since"], now)}[st]
+    when = when.replace("just now ago", "just now")
+    fm = font("sans", 20, 500)
+    d.text((tx + cw + 12, my + 17), fit(d, when + (f" · {s['project']}" if s["project"] else ""), fm, x + w - 20 - tx - cw - 12),
+           font=fm, fill=col if st in ("needs", "done") else MUTED, anchor="lm")
 
 
 def _gpu_strip(g, c):
@@ -363,80 +575,12 @@ def _empty(img, d, W, H, t):
            fill=MUTED, anchor="ma")
 
 
-def _card(img, d, x, y, w, h, s, t):
-    needs = s["state"] == "needs"
-    col = CLAUDE if needs else DONE
-    now = time.time()
-    if needs:                                              # breathing glow
-        level = 3 + round(4 * (0.5 + 0.5 * math.sin(t * 2 * math.pi / 1.8)))
-        gl = glow(w, h, 20, CLAUDE, 14, level)
-        img.alpha_composite(gl, (x - 28, y - 28))
-    img.alpha_composite(rrect(w, h, 20, CARD_HI if needs else CARD), (x, y))
-    img.alpha_composite(rrect(6, h - 36, 3, col), (x + 14, y + 18))
-
-    # icon
-    icx = x + 38
-    if needs:
-        scale = 6 if h >= 150 else (5 if h >= 118 else 4)
-        m = mascot(scale, t + hash(s["id"]) % 7 * 0.13, "wave")
-        img.alpha_composite(m, (icx, y + (h - m.height) // 2))
-        tx = icx + m.width + 30
-    else:
-        size = 64 if h >= 118 else 54
-        ring = int((t * 6) % 9) if (now - s["since"]) < 90 else 0
-        img.alpha_composite(check_icon(size + 24, DONE, ring), (icx + 8, y + (h - size - 24) // 2))
-        tx = icx + 126
-
-    # right: state label + time
-    label = "NEEDS YOUR ANSWER" if needs else "FINISHED"
-    spaced(d, (x + w - 28, y + h // 2 - 30), label, font("sans", 15, 700), col, track=2.2, anchor_right=True)
-    when = ("waiting " if needs else "") + ago(s["since"], now) + ("" if needs else " ago")
-    if when.startswith("just now ago"): when = "just now"
-    d.text((x + w - 28, y + h // 2 - 2), when, font=font("sans", 24, 500), fill=INK2, anchor="ra")
-    right = x + w - 28 - max(d.textlength(when, font=font("sans", 24, 500)), 190) - 30
-
-    # title + meta
-    ft = font("serif", 33 if h >= 118 else 28, 600)
-    title = fit(d, s["title"] or s["project"] or "Claude session", ft, right - tx)
-    ty = y + h // 2 - (44 if s["msg"] and h >= 118 else 34)
-    d.text((tx, ty), title, font=ft, fill=INK)
-    my = ty + (50 if h >= 118 else 42)
-    mx = tx + _chip(img, d, tx, my, place(s), col) + 14
-    fm = font("sans", 19, 400)
-    d.text((mx, my + 15), fit(d, s["project"], fm, right - mx), font=fm, fill=MUTED, anchor="lm")
-    if s["msg"] and h >= 118:
-        d.text((tx, my + 38), fit(d, s["msg"], fm, right - tx), font=fm, fill=INK2)
-
-
 def _chip(img, d, x, y, text, col):
-    f = font("sans", 17, 600)
+    f = font("sans", 19, 650)
     w = int(d.textlength(text, font=f) + 24)
-    img.alpha_composite(rrect(w, 30, 15, col + (46,)), (int(x), int(y)))
-    d.text((x + w / 2, y + 15), text, font=f, fill=col, anchor="mm")
+    img.alpha_composite(rrect(w, 34, 17, col + (46,)), (int(x), int(y)))
+    d.text((x + w / 2, y + 17), text, font=f, fill=col, anchor="mm")
     return w
-
-
-def _row(img, d, x, y, w, h, s, t):
-    working = s["state"] == "working"
-    img.alpha_composite(rrect(w, h, 14, CARD), (x, y))
-    cy = y + h // 2
-    if working:
-        d.text((x + 34, cy + 1), spinner(t + (hash(s["id"]) % 10) * 0.07), font=font("sym", 28), fill=CLAUDE, anchor="mm")
-    else:
-        d.ellipse([x + 29, cy - 5, x + 39, cy + 5], fill=MUTED)
-    cw = _chip(img, d, x + 62, cy - 15, place(s), CLAUDE if working else MUTED)
-    tx = x + 62 + cw + 16
-    fr = font("sans", 17, 500)
-    when = ("working " if working else "idle ") + ago(s["since"], time.time())
-    d.text((x + w - 22, cy), when, font=fr, fill=MUTED, anchor="rm")
-    right = x + w - 22 - d.textlength(when, font=fr) - 24
-    ft = font("sans", 22, 600 if working else 500)
-    title = fit(d, s["title"] or s["project"] or "Claude session", ft, max(40, right - tx - 160))
-    d.text((tx, cy), title, font=ft, fill=INK if working else INK2, anchor="lm")
-    px = tx + d.textlength(title, font=ft) + 14
-    if s["project"] and px < right - 40:
-        d.text((px, cy + 1), fit(d, s["project"], font("sans", 18, 400), right - px), font=font("sans", 18, 400),
-               fill=MUTED, anchor="lm")
 
 
 # ---- small badge on the GPU dashboard ----------------------------------------------------------

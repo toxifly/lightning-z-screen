@@ -31,7 +31,7 @@ class Controller:
     def __init__(self, make, state_dir=None, set_brightness=None, on_claude_status=None):
         """make(request, fd) -> mode object; raises on bad requests.
         set_brightness(value) applies a brightness to the screen.
-        on_claude_status(sessions) receives the Claude session list (claude_board.Board.update)."""
+        on_claude_status(sessions, tmux) receives the Claude session list (claude_board.Board.update)."""
         self.make, self.state_dir, self.set_brightness = make, state_dir, set_brightness
         self.on_claude_status = on_claude_status
         self.lock = threading.RLock()           # held for a whole switch (make() can take seconds)
@@ -174,7 +174,9 @@ class Controller:
                 if not self.on_claude_status:
                     return reply(conn, ok=False, error="the Claude board is not available")
                 sessions = req.get("sessions")
-                self.on_claude_status(sessions if isinstance(sessions, list) else [])
+                layout = req.get("tmux")
+                self.on_claude_status(sessions if isinstance(sessions, list) else [],
+                                      layout if isinstance(layout, list) else [])
                 return reply(conn, ok=True)
             if req.get("mode") == "brightness":
                 if "value" in req:
