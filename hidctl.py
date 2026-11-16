@@ -56,9 +56,11 @@ class Ctl:
             t = f"POST {cmd} 1\r\nSeqNumber={seq}\r\nContentType=json\r\nContentLength={len(js)}\r\n\r\n{js}"
         self._write(t)
     def conn(self):
-        """Hello; MSI's service sends it twice and waits for the reply before any other command."""
+        """Hello; MSI's service sends it twice and waits for the reply before any other command.
+        Wait the full second: a late reply to an earlier conn can arrive first, and a switch sent
+        straight after it can be lost while the screen is still switching."""
         self.post("conn", seq=1); self.post("conn", seq=1)
-        return self._read(1.0, want=1)
+        return self._read(1.0)
     # Like MSI's service, these don't wait for a reply.
     def brightness(self, v): self.post("brightness", {"value": int(v)})
     def rotate(self, deg): self.post("rotate", {"degree": int(deg)})

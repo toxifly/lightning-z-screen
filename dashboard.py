@@ -342,6 +342,12 @@ def main():
         ctl.serve(a.control, a.control_users)
 
     signal.signal(signal.SIGTERM, lambda *_: sys.exit())   # stop cleanly on systemctl stop / shutdown
+    stopping = threading.Event()
+
+    def retake_screen():
+        if not stopping.is_set():
+            try: hidctl.session(usb_frames=True)
+            except Exception: pass
     last, sent = None, 0.0
     while True:
         scr = aicast.Screen()
@@ -352,6 +358,11 @@ def main():
                 info = hidctl.session(usb_frames=True, brightness=ctl.brightness)
                 if ctl.brightness is None and isinstance(info.get("Brightness"), int):
                     ctl.brightness = info["Brightness"]
+                # once more in a while, in case the screen was still busy switching to the
+                # animation (e.g. the previous service instance stopping just before)
+                again = threading.Timer(5, retake_screen)
+                again.daemon = True
+                again.start()
             except Exception as e:
                 print(f"control channel: {e}", flush=True)
             if (scr.w, scr.h) != (W, H):
@@ -371,6 +382,7 @@ def main():
                 if isinstance(mode, modes.WebPage):  # the browser is paced by our frame acks
                     time.sleep(max(0.0, 1.0 / a.web_fps - (sent - t0)))
         except (KeyboardInterrupt, SystemExit):
+            stopping.set()
             try:
                 hidctl.session(usb_frames=False)  # back to MSI's animation, not a frozen frame
             except Exception:
