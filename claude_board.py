@@ -264,7 +264,8 @@ def ago(since, now):
 def place(s):
     if s["where"] == "tmux" and s["pos"]:
         return "tmux " + s["pos"]
-    return {"app": "Claude app", "vscode": "VS Code", "terminal": "terminal"}.get(s["where"], s["where"] or "—")
+    return {"app": "Claude app", "vscode": "VS Code", "ptyxis": "Ptyxis", "kitty": "kitty",
+            "terminal": "terminal", "other": "elsewhere"}.get(s["where"], s["where"] or "—")
 
 
 ORDER = {"needs": 0, "done": 1, "working": 2, "idle": 3}
@@ -294,7 +295,7 @@ def render(W, H, sessions, g, c, t=None, tmux=None):
         mw = int((W - 2 * pad) * 0.56)
         _map(img, d, pad, top, mw, bottom - top, tmux, by_pos, t)
         lx = pad + mw + 22
-    shown = [s for s in ss if s["state"] != "idle" or s["pos"] not in by_pos or not tmux]
+    shown = [s for s in ss if s["state"] != "idle"]          # seen sessions stay out of the way
     _list(img, d, lx, top, W - pad - lx, bottom - top, shown, ss, t)
     return img
 
@@ -495,6 +496,7 @@ def _list(img, d, x, y, w, h, shown, ss, t):
         d.text((x + w // 2, y + h // 2), "All caught up", font=font("serif", 42, 600), fill=INK, anchor="ma")
         d.text((x + w // 2, y + h // 2 + 58), "Nothing needs you right now" if ss else "No Claude sessions yet",
                font=font("sans", 22, 500), fill=MUTED, anchor="ma")
+        _idle_note(d, x, y + h - 30, w, y + h, ss)
         return
     gap = 12
     big = 128 if len(shown) <= 4 else 108
@@ -510,6 +512,22 @@ def _list(img, d, x, y, w, h, shown, ss, t):
         cy += ih + gap
     if n < len(shown):
         d.text((x + w // 2, cy + 2), f"+ {len(shown) - n} more", font=font("sans", 20, 600), fill=MUTED, anchor="ma")
+        cy += 36
+    _idle_note(d, x, cy, w, y + h, ss)
+
+
+def _idle_note(d, x, y, w, bottom, ss):
+    """One quiet line for the sessions you have already seen, by where they run."""
+    idle = {}
+    for s in ss:
+        if s["state"] == "idle":
+            k = "tmux" if s["where"] == "tmux" else place(s)
+            idle[k] = idle.get(k, 0) + 1
+    if not idle or y + 30 > bottom:
+        return
+    txt = "Seen · " + " · ".join(f"{n} {k}" for k, n in sorted(idle.items(), key=lambda kv: -kv[1]))
+    f = font("sans", 20, 500)
+    d.text((x + 8, max(y + 4, bottom - 30) if y < bottom - 60 else y + 4), fit(d, txt, f, w - 16), font=f, fill=MUTED)
 
 
 def _item(img, d, x, y, w, h, s, t):

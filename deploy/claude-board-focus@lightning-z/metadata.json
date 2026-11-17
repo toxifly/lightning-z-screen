@@ -1,0 +1,6 @@
+{
+  "uuid": "claude-board-focus@lightning-z",
+  "name": "Claude board focus",
+  "description": "Tells the Lightning Z Claude board which window has the focus (writes its pid and title to $XDG_RUNTIME_DIR/claude-board-focus.json), so finished Claude sessions you have looked at stop asking for attention.",
+  "shell-version": ["45", "46", "47", "48", "49", "50"]
+}

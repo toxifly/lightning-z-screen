@@ -38,15 +38,31 @@ os.replace(tmp, path)
 EOF
 }
 
+EXT="claude-board-focus@lightning-z"
 if [ "${1:-}" = "--uninstall" ]; then
   systemctl --user disable --now claude-board.service 2>/dev/null || true
   rm -f "$UNIT" "$BIN"; systemctl --user daemon-reload
   hooks remove
+  gnome-extensions disable "$EXT" 2>/dev/null || true
+  rm -rf "$HOME/.local/share/gnome-shell/extensions/$EXT"
   echo "Removed. Session state in ~/.local/state/claude-board can be deleted."
   exit 0
 fi
 
 install -D -m 755 "$SRC/claude-board" "$BIN"
+# GNOME Shell extension that reports the focused window (to tell when you have seen a session
+# outside tmux: Claude app, VS Code, other terminals). Loaded by GNOME at the next log-in.
+if command -v gnome-extensions >/dev/null; then
+  mkdir -p "$HOME/.local/share/gnome-shell/extensions/$EXT"
+  cp "$SRC/deploy/$EXT/"* "$HOME/.local/share/gnome-shell/extensions/$EXT/"
+  gnome-extensions enable "$EXT" 2>/dev/null || python3 - "$EXT" <<'PY'
+import ast, subprocess, sys
+cur = subprocess.run(["gsettings", "get", "org.gnome.shell", "enabled-extensions"], capture_output=True, text=True).stdout
+lst = ast.literal_eval(cur.replace("@as ", "")) if cur.strip() else []
+if sys.argv[1] not in lst:
+    subprocess.run(["gsettings", "set", "org.gnome.shell", "enabled-extensions", str(lst + [sys.argv[1]])])
+PY
+fi
 mkdir -p "$(dirname "$UNIT")"
 cat > "$UNIT" <<EOF
 [Unit]
@@ -68,3 +84,5 @@ systemctl --user restart claude-board.service
 systemctl --user --no-pager --lines=3 status claude-board.service || true
 echo "Hooks added to $SETTINGS (backup: $SETTINGS.bak-claude-board)."
 echo "Claude sessions started before this report once they get their next message."
+gnome-extensions info "$EXT" 2>/dev/null | grep -q "State: ACTIVE" ||
+  echo "Log out and back in once so GNOME loads the focus extension ($EXT)."

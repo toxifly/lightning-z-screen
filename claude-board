@@ -11,8 +11,10 @@
 
 States: needs (waiting for an answer, a permission or a plan approval), done (finished, not looked
 at yet), working, idle (finished and seen). A finished session counts as seen when its tmux pane
-is the focused pane for a second (or was already focused when it finished), or when you send it a
-message. The screen service only ever receives the list; it never reads your files.
+is the focused pane for a second (or was already focused when it finished), when the window it runs
+in (Claude app, VS Code, a terminal) has the focus for a second, or when you send it a message.
+Window focus comes from the small GNOME Shell extension claude-board-focus, which writes the focused
+window's pid and title to $XDG_RUNTIME_DIR/claude-board-focus.json. The screen service only ever receives the list; it never reads your files.
 """
 import json, os, re, socket, subprocess, sys, time
 
@@ -23,6 +25,10 @@ ASK_TOOLS = {"AskUserQuestion": "Claude is asking you a question",
              "ExitPlanMode": "Claude wants you to approve a plan"}
 NEEDS_NOTES = ("permission_prompt", "elicitation_dialog")
 SEEN_AFTER = 1.0          # seconds a pane must have focus to count as looked at
+DONE_TTL = 8 * 3600       # a finished session nobody looked at for this long stops asking for attention
+FOCUS_FILE = os.path.join(os.environ.get("XDG_RUNTIME_DIR") or f"/run/user/{os.getuid()}", "claude-board-focus.json")
+TERMINALS = {"ptyxis": "ptyxis", "kitty": "kitty", "gnome-terminal-": "terminal", "konsole": "terminal",
+             "alacritty": "terminal", "wezterm-gui": "terminal", "foot": "terminal", "xterm": "terminal"}
 RESEND = 10               # push at least this often, so the screen knows the agent is alive
 SHELLS = {"sh", "bash", "dash", "zsh", "fish"}
 
@@ -221,8 +227,80 @@ def clean_title(t):
     return "" if t in ("", "claude", "Claude Code", socket.gethostname()) else t
 
 
+_hosts = {}
+
+
+def host(pid, entry):
+    """(where, ancestor pids) of a Claude process: "app" (Claude desktop), "vscode" (extension or its
+    terminal), "ptyxis" / "kitty" / "terminal", or "other". Cached per pid."""
+    if pid in _hosts:
+        return _hosts[pid]
+    chain, where, q = set(), None, pid
+    try:
+        with open(f"/proc/{pid}/environ", "rb") as f:
+            env = dict(l.split(b"=", 1) for l in f.read().split(b"\0") if b"=" in l)
+    except OSError:
+        env = {}
+    if "desktop" in entry:
+        where = "app"
+    elif "vscode" in entry or env.get(b"TERM_PROGRAM") == b"vscode":
+        where = "vscode"
+    for _ in range(14):
+        try:
+            with open(f"/proc/{q}/stat") as f:
+                head, tail = f.read().rsplit(")", 1)
+            comm, q = head.split("(", 1)[1], int(tail.split()[1])
+        except (OSError, ValueError, IndexError):
+            break
+        if q <= 1:
+            break
+        chain.add(q)
+        try:
+            with open(f"/proc/{q}/comm") as f:
+                c = f.read().strip()
+        except OSError:
+            continue
+        if where is None:
+            if c in ("code", "code-insiders", "codium"):
+                where = "vscode"
+            elif c.startswith("claude-desktop"):
+                where = "app"
+            else:
+                where = next((v for k, v in TERMINALS.items() if c.startswith(k)), None)
+    _hosts[pid] = (where or "other", chain)
+    return _hosts[pid]
+
+
+def focus():
+    """The focused window as written by the GNOME Shell extension: {"pid", "title", ...} or None."""
+    try:
+        with open(FOCUS_FILE) as f:
+            w = json.load(f)
+        return w if isinstance(w, dict) and int(w.get("pid") or 0) > 0 else None
+    except (OSError, ValueError, TypeError):
+        return None
+
+
+def visible_outside_tmux(sessions, win):
+    """Ids of the non-tmux sessions that the focused window shows."""
+    fpid, title = int(win["pid"]), (win.get("title") or "").lower()
+    cands = [s for s in sessions if fpid in s["_chain"]]
+    if len(cands) <= 1:
+        return {s["id"] for s in cands}
+    by_title = {s["id"] for s in cands if s["_title"] and s["_title"].lower() in title}
+    if by_title:
+        return by_title
+    where = cands[0]["_where"]
+    if where == "vscode":                        # the window title names the open folder
+        return {s["id"] for s in cands if s["_project"] and s["_project"].lower() in title}
+    if where == "app":                           # one window lists them all in its sidebar
+        return {s["id"] for s in cands}
+    return set()                                 # terminal tabs we can't tell apart
+
+
 def run():
     focus_start, last_sent, last_payload = {}, 0.0, None
+    focus_key, focus_since = None, 0.0
     while True:
         now = time.time()
         panes, focused, layout = tmux()
@@ -232,13 +310,19 @@ def run():
         for p in focused:
             focus_start.setdefault(p, now)
 
-        out = []
+        win = focus()
+        wkey = (win["pid"], win.get("title")) if win else None
+        if wkey != focus_key:
+            focus_key, focus_since = wkey, now
+
+        out, outside = [], []
         for s in all_sessions():
             sid = s.get("id")
             if not sid:
                 continue
             if s.get("pid") and not alive(s["pid"]):
                 remove(sid)
+                _hosts.pop(s["pid"], None)
                 continue
             if not s.get("pid") and now - s.get("since", 0) > 86400:
                 remove(sid)
@@ -250,21 +334,34 @@ def run():
                 fs = focus_start[pane]
                 if fs <= s.get("since", 0) or now - fs >= SEEN_AFTER:
                     s["seen"] = mark_seen(sid, s.get("since"))
-            state = s.get("state", "idle")
-            if state == "done" and s.get("seen"):
-                state = "idle"
             cwd = s.get("cwd") or ""
             project = "~" if cwd.rstrip("/") == HOME else os.path.basename(cwd.rstrip("/")) or cwd
             if in_tmux:
-                sess, win, pn, ptitle = panes[pane]
-                pos, where = (f"{win}.{pn}" if sess == "main" else f"{sess}:{win}.{pn}"), "tmux"
+                sess, win_i, pn, ptitle = panes[pane]
+                pos, where = (f"{win_i}.{pn}" if sess == "main" else f"{sess}:{win_i}.{pn}"), "tmux"
             else:
                 ptitle, pos = "", ""
-                entry = s.get("entry", "")
-                where = "app" if "desktop" in entry else ("vscode" if ("vscode" in entry or "ide" in entry) else "terminal")
+                where, chain = host(s["pid"], s.get("entry", "")) if s.get("pid") else ("other", set())
             title = clean_title(ptitle) or transcript_title(s.get("transcript")) or ""
+            if not in_tmux:
+                outside.append(dict(s, _chain=chain, _where=where, _title=title, _project=project))
             out.append({"id": sid, "title": title, "project": project, "pos": pos, "where": where,
-                        "state": state, "since": s.get("since", now), "msg": s.get("msg", "")})
+                        "state": s.get("state", "idle"), "seen": s.get("seen"), "since": s.get("since", now),
+                        "msg": s.get("msg", "")})
+
+        # sessions outside tmux: seen when the window showing them has had the focus for a second
+        if win and outside:
+            shown = visible_outside_tmux(outside, win)
+            for s in outside:
+                if (s["id"] in shown and s.get("state") == "done" and not s.get("seen")
+                        and (focus_since <= s.get("since", 0) or now - focus_since >= SEEN_AFTER)):
+                    if mark_seen(s["id"], s.get("since")):
+                        next(o for o in out if o["id"] == s["id"])["seen"] = True
+
+        for o in out:
+            seen = o.pop("seen")
+            if o["state"] == "done" and (seen or now - o["since"] > DONE_TTL):
+                o["state"] = "idle"
 
         out.sort(key=lambda x: x["id"])
         payload = json.dumps({"mode": "claude-status", "sessions": out, "tmux": layout})
@@ -308,7 +405,8 @@ def main():
     elif cmd == "list":
         for s in sorted(all_sessions(), key=lambda s: s.get("since", 0)):
             state = "idle" if s.get("state") == "done" and s.get("seen") else s.get("state")
-            print(f"{state:8} {s.get('pane', '-'):5} {s.get('cwd', '')}  {s['id']}")
+            where = "tmux" if s.get("pane") else (host(s["pid"], s.get("entry", ""))[0] if s.get("pid") else "-")
+            print(f"{state:8} {where:8} {s.get('pane', '-'):5} {s.get('cwd', '')}  {s['id']}")
     elif cmd == "seen":
         which = sys.argv[2] if len(sys.argv) > 2 else "all"
         for s in all_sessions():
