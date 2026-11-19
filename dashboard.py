@@ -261,6 +261,8 @@ class Dashboard:
     done = False
     FADE = 0.5                           # seconds of cross-fade between the two views
     HOLD = 20                            # seconds the board stays up after the last active session
+    CLAUDE_GPU_POLL = 10.0               # seconds between NVML/CPU polls while on the Claude board
+    JPEG_CACHE_MAX = 32                  # cached JPEG frames (~3.5 MB) for the 2 s animated loop
 
     def __init__(self, gpu, cpu, wv, hist, w, h, rotate, fps, quality, board=None):
         self.gpu, self.cpu, self.wv, self.hist = gpu, cpu, wv, hist
@@ -271,11 +273,13 @@ class Dashboard:
         self.view, self.last, self.fade = "gpu", None, None
         self.active_at = -1e9
         self._claude_key = None
+        self._jpeg_cache = collections.OrderedDict()
 
-    def read(self):
-        """GPU and CPU readings, sampled (and added to the history) at most once per dashboard period."""
+    def read(self, period=None):
+        """GPU and CPU readings, sampled (and added to the history) at most once per period."""
         now = time.monotonic()
-        if self.sample is None or now - self.sampled >= self.period * 0.9:
+        wait = self.period * 0.9 if period is None else period
+        if self.sample is None or now - self.sampled >= wait:
             g, c = self.gpu.read(), self.cpu.read()
             self.hist["power"].append(g["power"]); self.hist["temp"].append(g["temp"])
             self.sample, self.sampled = (g, c), now
@@ -294,14 +298,10 @@ class Dashboard:
             claude_board.badge(img, W - 24 - clock_w - 20, 18, self.board.snapshot(), time.time())
         return img
 
-    def claude_frame(self, skip_unchanged=False):
-        g, c = self.read()
+    def claude_frame(self):
+        g, c = self.read(self.CLAUDE_GPU_POLL)
         W, H = self._wh()
-        prev = self._claude_key if skip_unchanged else None
-        img, key = claude_board.render_if_changed(
-            prev, W, H, self.board.snapshot(), g, c, tmux=self.board.layout())
-        self._claude_key = key
-        return img
+        return claude_board.render(W, H, self.board.snapshot(), g, c, tmux=self.board.layout())
 
     def image(self):
         img = self.gpu_frame()
@@ -321,10 +321,23 @@ class Dashboard:
             period = self.period
         time.sleep(max(0.0, self.due - time.monotonic()))
         self.due = max(self.due + period, time.monotonic())
+        cache_k = None
         if claude:
-            img = self.claude_frame(skip_unchanged=self.view == "claude" and not self.fade)
-            if img is None:
-                return None              # nothing visible changed; caller repeats last JPEG every 2 s
+            g, c = self.read(self.CLAUDE_GPU_POLL)
+            W, H = self._wh()
+            key, draw = claude_board.plan(W, H, self.board.snapshot(), g, c, tmux=self.board.layout())
+            if self.view == "claude" and not self.fade:
+                if key == self._claude_key:
+                    return None          # nothing visible changed; caller repeats last JPEG every 2 s
+                cache_k = (key, self.rotate, self.quality)
+                hit = self._jpeg_cache.get(cache_k)
+                if hit is not None:
+                    self._jpeg_cache.move_to_end(cache_k)
+                    self._claude_key = key
+                    return hit           # 0 ms render + 0 ms JPEG encode!
+            self._claude_key = key
+            cache_k = (key, self.rotate, self.quality)
+            img = draw()
         else:
             self._claude_key = None
             img = self.gpu_frame()
@@ -344,7 +357,12 @@ class Dashboard:
             img = img.rotate(-self.rotate, expand=True)
         b = io.BytesIO()
         (img if img.mode == "RGB" else img.convert("RGB")).save(b, "JPEG", quality=self.quality)
-        return b.getvalue()
+        jpg = b.getvalue()
+        if claude and not self.fade and cache_k is not None:
+            self._jpeg_cache[cache_k] = jpg
+            while len(self._jpeg_cache) > self.JPEG_CACHE_MAX:
+                self._jpeg_cache.popitem(last=False)
+        return jpg
 
     def close(self):
         self._claude_key = None

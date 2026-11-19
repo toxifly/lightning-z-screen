@@ -20,8 +20,10 @@ from PIL import Image, ImageDraw, ImageFilter, ImageFont
 HERE = os.path.dirname(os.path.abspath(__file__))
 FONT_DIR = os.path.join(HERE, "fonts")
 DEJAVU = "/usr/share/fonts/truetype/dejavu/"
-FPS = 4                      # frame rate while a session is working (comet, spinners)
+FPS = 12                     # frame rate while a session is working (cached 2 s loop)
 CALM_FPS = 2                 # frame rate otherwise: needs/done/idle tiles barely move
+LOOP = 2.0                   # seconds per harmonized animation cycle (all motions divide this)
+LOOP_STEPS = int(LOOP * FPS) # 24 discrete frames per cycle (2 fps visits 4 of them)
 STALE = 30                   # seconds without a push from the agent before the list is dropped
 
 # ---- Claude palette (dark, warm) ---------------------------------------------------------------
@@ -217,21 +219,25 @@ def check_icon(size, color, ring):
     return img.resize((size, size), Image.LANCZOS)
 
 
-# Claude's spark: tapered, rounded rays of uneven length around a small core
-RAYS = ((0, 1.00), (31, .80), (59, .94), (91, .73), (120, .98), (151, .83),
-        (180, .96), (209, .76), (240, .99), (269, .81), (300, .92), (330, .77))
-SPARK_ROT = 120              # 3-degree steps: invisible stepping, small sprite cache
-SPARK_BREATHE = 16           # steps per breathing cycle
+def _loop_slot(t):
+    return int(((t % LOOP) / LOOP) * LOOP_STEPS) % LOOP_STEPS
 
 
-def _draw_spark(size, rot, bphase, color, breathe):
+# Claude's spark: 6-fold symmetric alternating rays so a 60° rotation over LOOP loops seamlessly
+RAYS = tuple((k * 60 + d, ln) for k in range(6) for d, ln in ((0, 0.98), (31, 0.78)))
+
+
+@functools.lru_cache(maxsize=64)
+def _spark_frame(size, color, breathe, slot):
     S = size * SS
     img = Image.new("RGBA", (S, S), (0, 0, 0, 0))
     d = Draw(img)
     c, R, w0 = S / 2, S * 0.48, S * 0.095
+    rot = math.radians(60.0 * slot / LOOP_STEPS)
+    bphase = 2 * math.pi * slot / LOOP_STEPS
     for i, (deg, ln) in enumerate(RAYS):
         a = math.radians(deg) + rot
-        L = min(R, R * ln * (1 + breathe * math.sin(bphase + i * 1.7)))
+        L = min(R, R * ln * (1 + breathe * math.sin(bphase + (i % 2) * math.pi)))
         ca, sa = math.cos(a), math.sin(a)
         px, py = -sa, ca
         x0, y0, x1, y1 = c + ca * S * 0.05, c + sa * S * 0.05, c + ca * (L - w0 * 0.3), c + sa * (L - w0 * 0.3)
@@ -243,27 +249,8 @@ def _draw_spark(size, rot, bphase, color, breathe):
     return img.resize((size, size), Image.LANCZOS)
 
 
-@functools.lru_cache(maxsize=64)
-def _spark_unrot(size, color, breathe, bstep):
-    return _draw_spark(size, 0.0, bstep * 2 * math.pi / SPARK_BREATHE, color, breathe)
-
-
-@functools.lru_cache(maxsize=256)
-def _spark_cached(size, color, breathe, bstep, rstep):
-    base = _spark_unrot(size, color, breathe, bstep)
-    if rstep == 0:
-        return base
-    return base.rotate(-rstep * (360.0 / SPARK_ROT), resample=Image.BILINEAR)
-
-
-def _spark_key(size, t, color=CLAUDE, breathe=0.0, spin=0.12):
-    rstep = round(((t * spin) % (2 * math.pi)) / (2 * math.pi) * SPARK_ROT) % SPARK_ROT if spin else 0
-    bstep = round(((t * 2.6) % (2 * math.pi)) / (2 * math.pi) * SPARK_BREATHE) % SPARK_BREATHE if breathe else 0
-    return (size, color, breathe, bstep, rstep)
-
-
 def spark(size, t, color=CLAUDE, breathe=0.0, spin=0.12):
-    return _spark_cached(*_spark_key(size, t, color, breathe, spin))
+    return _spark_frame(size, color, breathe, _loop_slot(t) if spin else 0)
 
 
 # The Claude Code mascot, from the block characters of the CLI's start-up banner (2x2 px per char)
@@ -290,15 +277,20 @@ EYES = [(1, x) for x in range(_ROW1[0], _ROW1[-1]) if not GRID[1][x]]     # hole
 ARM_R = max(x for x, v in enumerate(GRID[2]) if v)                        # right hand pixel
 
 
-def _mascot_state(t, mood):
-    blink = (t % 3.4) < 0.14 or mood == "sleep"
-    wave = mood == "wave" and bool(int(t * 4) % 2)
-    lift = 0
+def _mascot_slot_state(slot, mood):
+    if mood == "sleep":
+        return True, False, 0
+    blink = slot < 2
+    wave = mood == "wave" and bool((slot // 3) % 2)
     if mood == "hop":
-        m = t % 0.9
-        lift = 2 if m < 0.3 else (1 if m < 0.42 else 0)
-    elif mood in ("wave", "idle"):
-        lift = 1 if int(t * (3 if mood == "wave" else 1.2)) % 2 else 0
+        m = slot % 12
+        lift = 2 if m < 4 else (1 if m < 6 else 0)
+    elif mood == "wave":
+        lift = (slot // 4) % 2
+    elif mood == "idle":
+        lift = (slot // 12) % 2
+    else:
+        lift = 0
     return blink, wave, lift
 
 
@@ -323,20 +315,21 @@ def _mascot_sprite(scale, color, blink, wave, lift):
 
 def mascot(scale, t, mood="idle", color=CLAUDE):
     """Pixel mascot. mood: "wave" (needs you), "hop" (finished), "idle", "sleep"."""
-    return _mascot_sprite(scale, color, *_mascot_state(t, mood))
+    return _mascot_sprite(scale, color, *_mascot_slot_state(_loop_slot(t), mood))
 
 
 SPIN = "·✢✳✶✻✽"
-SPIN_FRAMES = SPIN + SPIN[-2:0:-1]
+SPIN_FRAMES = SPIN + SPIN[::-1]   # 12 steps -> 6 Hz over the 2 s master loop
 
 
 def spinner(t):
-    return SPIN_FRAMES[int(t * 7) % len(SPIN_FRAMES)]
+    return SPIN_FRAMES[(_loop_slot(t) // 2) % len(SPIN_FRAMES)]
 
 
 def ago(since, now):
     s = max(0, int(now - since))
-    if s < 60: return "just now" if s < 10 else f"{s} s"
+    if s < 15: return "just now"
+    if s < 60: return "< 1 min"
     if s < 3600: return f"{s // 60} min"
     return f"{s // 3600} h {s % 3600 // 60:02d} min"
 
@@ -367,8 +360,8 @@ def _paste(dst, src, xy):
     dst.paste(src, xy, src)
 
 
-def _glow_level(t):
-    return 3 + round(4 * (0.5 + 0.5 * math.sin(t * 2 * math.pi / 1.8)))
+def _glow_level(slot):
+    return 3 + round(4 * (0.5 + 0.5 * math.sin(2 * math.pi * slot / LOOP_STEPS)))
 
 
 def _body_key(W, H, ss, tmux):
@@ -432,18 +425,23 @@ def _when_text(st, since, now, project, is_tile):
     return w + (f" · {project}" if project else "")
 
 
-def render_if_changed(prev_key, W, H, sessions, g, c, t=None, tmux=None):
-    """Render the board, or return (None, key) if nothing visible changed since prev_key."""
+def plan(W, H, sessions, g, c, t=None, tmux=None):
+    """Return (frame_key, draw_fn) for the board at time t.
+
+    Because every animation is harmonized to the 2 s master loop (LOOP_STEPS = 24), frame_key
+    repeats identically across cycles while sessions, clock and GPU strip stay steady — allowing
+    the caller to cache encoded JPEGs directly by frame_key (0 ms render + 0 ms JPEG on hits)."""
     now = time.time()
     t = now if t is None else t
     pad = 26
+    slot = _loop_slot(t)
     ss = ordered(sessions)
     busy = any(s["state"] == "working" for s in ss)
-    level = _glow_level(t) if any(s["state"] == "needs" for s in ss) else None
+    level = _glow_level(slot) if any(s["state"] == "needs" for s in ss) else None
     bkey = _body_key(W, H, ss, tmux)
     clock = time.strftime("%H:%M")
     gstrip = tuple(_gpu_strip(g, c))
-    sp_key = _spark_key(58, t, breathe=0.07 if busy else 0.0, spin=0.35 if busy else 0.0)
+    sp_key = (58, CLAUDE, 0.07 if busy else 0.0, slot if busy else 0)
 
     base, slots = _get_body(bkey, level, W, H, ss, tmux)
     dyn_key = []
@@ -452,30 +450,32 @@ def render_if_changed(prev_key, W, H, sessions, g, c, t=None, tmux=None):
         kind = sl[0]
         if kind == "comet":
             _, x, y, w, h, off = sl
-            step = _comet_step(t + off)
+            step = (slot + off) % LOOP_STEPS
             dyn_key.append(step)
             ops.append(("comet", x, y, w, h, step))
         elif kind == "tile_icon":
             _, x, y, w, h, ic, st, idx, sid_h = sl
             s = ss[idx]
+            off = sid_h % LOOP_STEPS
             if st == "needs":
                 sc = max(2, ic // 17)
-                ms = _mascot_state(t + sid_h % 7 * 0.13, "wave")
+                ms = _mascot_slot_state((slot + off) % LOOP_STEPS, "wave")
                 dyn_key.append(ms)
                 ops.append(("mascot_br", x + w - 14, y + h - 12, sc, CLAUDE, ms))
             elif st == "done":
-                ring = int((t * 6) % 9) if now - s["since"] < 90 else 0
+                m = slot // 2
+                ring = (m if m < 9 else 0) if now - s["since"] < 90 else 0
                 dyn_key.append(ring)
                 ops.append(("check_br", x + w - 14, y + h - 12, ic, ring))
             elif st == "working":
-                ch = spinner(t + sid_h % 10 * 0.07)
+                ch = SPIN_FRAMES[((slot + off) // 2) % len(SPIN_FRAMES)]
                 fsz = int(ic * 0.9)
                 dyn_key.append(ch)
                 ops.append(("text", (x + w - 16 - fsz // 2, y + h - 14 - fsz // 2), ch, font("sym", fsz), CLAUDE, "mm"))
             else:
                 sc = max(2, ic // 20)
                 mood = "sleep" if now - s["since"] > 600 else "idle"
-                ms = _mascot_state(t, mood)
+                ms = _mascot_slot_state(slot, mood)
                 dyn_key.append(ms)
                 ops.append(("mascot_br", x + w - 14, y + h - 12, sc, (120, 116, 106), ms))
         elif kind == "when":
@@ -489,76 +489,87 @@ def render_if_changed(prev_key, W, H, sessions, g, c, t=None, tmux=None):
         elif kind == "item_icon":
             _, x, cy, st, idx, sid_h = sl
             s = ss[idx]
+            off = sid_h % LOOP_STEPS
             if st == "needs":
-                ms = _mascot_state(t + sid_h % 7 * 0.13, "wave")
+                ms = _mascot_slot_state((slot + off) % LOOP_STEPS, "wave")
                 dyn_key.append(ms)
                 ops.append(("mascot_item", x + 30, cy, 3, CLAUDE, ms))
             elif st == "done":
-                ring = int((t * 6) % 9) if now - s["since"] < 90 else 0
+                m = slot // 2
+                ring = (m if m < 9 else 0) if now - s["since"] < 90 else 0
                 dyn_key.append(ring)
                 ops.append(("check_xy", x + 28, cy - 28, 56, ring))
             elif st == "working":
-                ch = spinner(t + sid_h % 10 * 0.07)
+                ch = SPIN_FRAMES[((slot + off) // 2) % len(SPIN_FRAMES)]
                 dyn_key.append(ch)
                 ops.append(("text", (x + 56, cy), ch, font("sym", 40), CLAUDE, "mm"))
         elif kind == "hero_mascot":
             _, x, y, w, h = sl
             sc = 7 if w > 600 else 6
-            ms = _mascot_state(t, "idle")
+            ms = _mascot_slot_state(slot, "idle")
             dyn_key.append(ms)
             ops.append(("mascot_hero", x, y, w, h, sc, ms))
         elif kind == "empty_z":
             _, ew, eh, mw = sl
-            zs = tuple(round(((t * 0.45 + i / 3) % 1.0) * 40) % 40 for i in range(3))
+            zs = tuple((slot + i * (LOOP_STEPS // 3)) % LOOP_STEPS for i in range(3))
             dyn_key.append(zs)
             ops.append(("empty_z", ew, eh, mw, zs))
 
     frame_key = (bkey, level, clock, gstrip, sp_key, tuple(dyn_key))
-    if prev_key is not None and frame_key == prev_key:
-        return None, frame_key
 
-    img = base.copy()
-    d = Draw(img)
-    strip, sx, sy = _header_right(W, pad, clock, gstrip)
-    img.paste(strip, (sx, sy))
-    _paste(img, _spark_cached(*sp_key), (pad - 4, 20))
-    for op in ops:
-        k = op[0]
-        if k == "comet":
-            _, x, y, w, h, step = op
-            sp, ox, oy = _comet_sprite(w, h, CLAUDE, step)
-            _paste(img, sp, (x + ox, y + oy))
-        elif k == "mascot_br":
-            _, rx, by, sc, col, ms = op
-            m = _mascot_sprite(sc, col, *ms)
-            _paste(img, m, (rx - m.width, by - m.height))
-        elif k == "check_br":
-            _, rx, by, ic, ring = op
-            m = check_icon(ic, DONE, ring)
-            _paste(img, m, (rx - m.width, by - m.height))
-        elif k == "mascot_item":
-            _, ix, cy, sc, col, ms = op
-            m = _mascot_sprite(sc, col, *ms)
-            _paste(img, m, (ix, cy - m.height // 2))
-        elif k == "check_xy":
-            _, ix, iy, sz, ring = op
-            _paste(img, check_icon(sz, DONE, ring), (ix, iy))
-        elif k == "mascot_hero":
-            _, x, y, w, h, sc, ms = op
-            m = _mascot_sprite(sc, CLAUDE, *ms)
-            _paste(img, m, (x + (w - m.width) // 2, y + h // 2 - m.height - 40))
-        elif k == "text":
-            _, xy, txt, f, fill, anchor = op
-            d.text(xy, txt, font=f, fill=fill, anchor=anchor)
-        elif k == "empty_z":
-            _, ew, eh, mw, zs = op
-            for step in zs:
-                p = step / 40.0
-                f = font("serif", int(22 + 18 * p), 500)
-                a = (1 - p) * min(1, p * 4)
-                zx, zy = ew // 2 + mw // 2 - 10 + int(40 * p), eh // 2 - 170 - int(90 * p)
-                d.text((zx, zy), "z", font=f, fill=mix(BG, MUTED, a))
-    return img, frame_key
+    def draw():
+        img = base.copy()
+        d = Draw(img)
+        strip, sx, sy = _header_right(W, pad, clock, gstrip)
+        img.paste(strip, (sx, sy))
+        _paste(img, _spark_frame(*sp_key), (pad - 4, 20))
+        for op in ops:
+            k = op[0]
+            if k == "comet":
+                _, x, y, w, h, step = op
+                sp, ox, oy = _comet_sprite(w, h, CLAUDE, step)
+                _paste(img, sp, (x + ox, y + oy))
+            elif k == "mascot_br":
+                _, rx, by, sc, col, ms = op
+                m = _mascot_sprite(sc, col, *ms)
+                _paste(img, m, (rx - m.width, by - m.height))
+            elif k == "check_br":
+                _, rx, by, ic, ring = op
+                m = check_icon(ic, DONE, ring)
+                _paste(img, m, (rx - m.width, by - m.height))
+            elif k == "mascot_item":
+                _, ix, cy, sc, col, ms = op
+                m = _mascot_sprite(sc, col, *ms)
+                _paste(img, m, (ix, cy - m.height // 2))
+            elif k == "check_xy":
+                _, ix, iy, sz, ring = op
+                _paste(img, check_icon(sz, DONE, ring), (ix, iy))
+            elif k == "mascot_hero":
+                _, x, y, w, h, sc, ms = op
+                m = _mascot_sprite(sc, CLAUDE, *ms)
+                _paste(img, m, (x + (w - m.width) // 2, y + h // 2 - m.height - 40))
+            elif k == "text":
+                _, xy, txt, f, fill, anchor = op
+                d.text(xy, txt, font=f, fill=fill, anchor=anchor)
+            elif k == "empty_z":
+                _, ew, eh, mw, zs = op
+                for step in zs:
+                    p = step / float(LOOP_STEPS)
+                    f = font("serif", int(22 + 18 * p), 500)
+                    a = (1 - p) * min(1, p * 4)
+                    zx, zy = ew // 2 + mw // 2 - 10 + int(40 * p), eh // 2 - 170 - int(90 * p)
+                    d.text((zx, zy), "z", font=f, fill=mix(BG, MUTED, a))
+        return img
+
+    return frame_key, draw
+
+
+def render_if_changed(prev_key, W, H, sessions, g, c, t=None, tmux=None):
+    """Render the board, or return (None, key) if nothing visible changed since prev_key."""
+    key, draw = plan(W, H, sessions, g, c, t=t, tmux=tmux)
+    if prev_key is not None and key == prev_key:
+        return None, key
+    return draw(), key
 
 
 def render(W, H, sessions, g, c, t=None, tmux=None):
@@ -638,11 +649,11 @@ def wrap(d, text, f, maxw, lines):
     return out
 
 
-COMET_STEPS = 60             # quantized perimeter positions per loop (2.4 s -> 25 steps/s)
+COMET_STEPS = LOOP_STEPS     # 24 perimeter steps per 2 s loop (1 step per frame at 12 fps)
 
 
-def _comet_step(t, period=2.4):
-    return round(((t / period) % 1.0) * COMET_STEPS) % COMET_STEPS
+def _comet_step(t, period=LOOP):
+    return int(((t / period) % 1.0) * COMET_STEPS) % COMET_STEPS
 
 
 @functools.lru_cache(maxsize=512)
@@ -733,7 +744,7 @@ def _tile(img, d, x, y, w, h, p, idx, s, glow_level, slots):
     _paste(img, rrect(w, h, r, fill, col + ((200,) if st != "idle" else (60,)), 2), (x, y))
     sid_h = hash(s["id"])
     if st == "working":
-        slots.append(("comet", x, y, w, h, sid_h % 10 * 0.23))
+        slots.append(("comet", x, y, w, h, sid_h % LOOP_STEPS))
 
     # top: position + state label
     d.text((x + 18, y + 12), p["pos"], font=font("sans", 32, 700), fill=INK if st != "idle" else INK2)
