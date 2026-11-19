@@ -270,6 +270,7 @@ class Dashboard:
         self.sample, self.sampled = None, 0.0
         self.view, self.last, self.fade = "gpu", None, None
         self.active_at = -1e9
+        self._claude_key = None
 
     def read(self):
         """GPU and CPU readings, sampled (and added to the history) at most once per dashboard period."""
@@ -293,10 +294,14 @@ class Dashboard:
             claude_board.badge(img, W - 24 - clock_w - 20, 18, self.board.snapshot(), time.time())
         return img
 
-    def claude_frame(self):
+    def claude_frame(self, skip_unchanged=False):
         g, c = self.read()
         W, H = self._wh()
-        return claude_board.render(W, H, self.board.snapshot(), g, c, tmux=self.board.layout()).convert("RGB")
+        prev = self._claude_key if skip_unchanged else None
+        img, key = claude_board.render_if_changed(
+            prev, W, H, self.board.snapshot(), g, c, tmux=self.board.layout())
+        self._claude_key = key
+        return img
 
     def image(self):
         img = self.gpu_frame()
@@ -316,7 +321,13 @@ class Dashboard:
             period = self.period
         time.sleep(max(0.0, self.due - time.monotonic()))
         self.due = max(self.due + period, time.monotonic())
-        img = self.claude_frame() if claude else self.gpu_frame()
+        if claude:
+            img = self.claude_frame(skip_unchanged=self.view == "claude" and not self.fade)
+            if img is None:
+                return None              # nothing visible changed; caller repeats last JPEG every 2 s
+        else:
+            self._claude_key = None
+            img = self.gpu_frame()
         view = "claude" if claude else "gpu"
         now = time.monotonic()
         if view != self.view:
@@ -332,11 +343,11 @@ class Dashboard:
         if self.rotate:
             img = img.rotate(-self.rotate, expand=True)
         b = io.BytesIO()
-        img.convert("RGB").save(b, "JPEG", quality=self.quality)
+        (img if img.mode == "RGB" else img.convert("RGB")).save(b, "JPEG", quality=self.quality)
         return b.getvalue()
 
     def close(self):
-        pass
+        self._claude_key = None
 
 
 def main():
@@ -378,6 +389,7 @@ def main():
         m = req.get("mode")
         if m in ("dashboard", "claude"):
             dash.force = m == "claude"           # claude: keep the sessions board on screen
+            dash._claude_key = None              # force a fresh frame after another mode
             return dash
         if m == "web":
             if not str(req.get("url", "")).startswith(("http://", "https://")):

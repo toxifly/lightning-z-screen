@@ -14,13 +14,13 @@ state: "needs"   waiting for an answer or a permission
 The GPU dashboard turns into this view by itself while any session is working, needs an answer or
 is done (the GPU numbers shrink to a strip in the header); `lightning-screen claude` keeps it on screen.
 """
-import functools, math, os, threading, time
+import collections, functools, math, os, threading, time
 from PIL import Image, ImageDraw, ImageFilter, ImageFont
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 FONT_DIR = os.path.join(HERE, "fonts")
 DEJAVU = "/usr/share/fonts/truetype/dejavu/"
-FPS = 4                      # frame rate while a session is working (comet, spinners)
+FPS = 12                     # frame rate while a session is working (comet, spinners)
 CALM_FPS = 2                 # frame rate otherwise: needs/done/idle tiles barely move
 STALE = 30                   # seconds without a push from the agent before the list is dropped
 
@@ -156,9 +156,14 @@ def fps(sessions):
 
 def fit(d, text, f, maxw):
     """text shortened with an ellipsis to fit maxw pixels."""
-    if d.textlength(text, font=f) <= maxw:
+    return _fit(text, f, round(maxw))
+
+
+@functools.lru_cache(maxsize=2048)
+def _fit(text, f, maxw):
+    if _length(f, text) <= maxw:
         return text
-    while text and d.textlength(text + "…", font=f) > maxw:
+    while text and _length(f, text + "…") > maxw:
         text = text[:-1]
     return text.rstrip() + "…"
 
@@ -215,17 +220,18 @@ def check_icon(size, color, ring):
 # Claude's spark: tapered, rounded rays of uneven length around a small core
 RAYS = ((0, 1.00), (31, .80), (59, .94), (91, .73), (120, .98), (151, .83),
         (180, .96), (209, .76), (240, .99), (269, .81), (300, .92), (330, .77))
+SPARK_ROT = 120              # 3-degree steps: invisible stepping, small sprite cache
+SPARK_BREATHE = 16           # steps per breathing cycle
 
 
-def spark(size, t, color=CLAUDE, breathe=0.0, spin=0.12):
+def _draw_spark(size, rot, bphase, color, breathe):
     S = size * SS
     img = Image.new("RGBA", (S, S), (0, 0, 0, 0))
     d = Draw(img)
     c, R, w0 = S / 2, S * 0.48, S * 0.095
-    rot = t * spin
     for i, (deg, ln) in enumerate(RAYS):
         a = math.radians(deg) + rot
-        L = min(R, R * ln * (1 + breathe * math.sin(t * 2.6 + i * 1.7)))
+        L = min(R, R * ln * (1 + breathe * math.sin(bphase + i * 1.7)))
         ca, sa = math.cos(a), math.sin(a)
         px, py = -sa, ca
         x0, y0, x1, y1 = c + ca * S * 0.05, c + sa * S * 0.05, c + ca * (L - w0 * 0.3), c + sa * (L - w0 * 0.3)
@@ -235,6 +241,29 @@ def spark(size, t, color=CLAUDE, breathe=0.0, spin=0.12):
         d.ellipse([x1 - w1 / 2, y1 - w1 / 2, x1 + w1 / 2, y1 + w1 / 2], fill=color)
     d.ellipse([c - w0, c - w0, c + w0, c + w0], fill=color)
     return img.resize((size, size), Image.LANCZOS)
+
+
+@functools.lru_cache(maxsize=64)
+def _spark_unrot(size, color, breathe, bstep):
+    return _draw_spark(size, 0.0, bstep * 2 * math.pi / SPARK_BREATHE, color, breathe)
+
+
+@functools.lru_cache(maxsize=256)
+def _spark_cached(size, color, breathe, bstep, rstep):
+    base = _spark_unrot(size, color, breathe, bstep)
+    if rstep == 0:
+        return base
+    return base.rotate(-rstep * (360.0 / SPARK_ROT), resample=Image.BILINEAR)
+
+
+def _spark_key(size, t, color=CLAUDE, breathe=0.0, spin=0.12):
+    rstep = round(((t * spin) % (2 * math.pi)) / (2 * math.pi) * SPARK_ROT) % SPARK_ROT if spin else 0
+    bstep = round(((t * 2.6) % (2 * math.pi)) / (2 * math.pi) * SPARK_BREATHE) % SPARK_BREATHE if breathe else 0
+    return (size, color, breathe, bstep, rstep)
+
+
+def spark(size, t, color=CLAUDE, breathe=0.0, spin=0.12):
+    return _spark_cached(*_spark_key(size, t, color, breathe, spin))
 
 
 # The Claude Code mascot, from the block characters of the CLI's start-up banner (2x2 px per char)
@@ -261,29 +290,40 @@ EYES = [(1, x) for x in range(_ROW1[0], _ROW1[-1]) if not GRID[1][x]]     # hole
 ARM_R = max(x for x, v in enumerate(GRID[2]) if v)                        # right hand pixel
 
 
-def mascot(scale, t, mood="idle", color=CLAUDE):
-    """Pixel mascot. mood: "wave" (needs you), "hop" (finished), "idle", "sleep"."""
-    g = [row[:] for row in GRID]
+def _mascot_state(t, mood):
     blink = (t % 3.4) < 0.14 or mood == "sleep"
+    wave = mood == "wave" and bool(int(t * 4) % 2)
+    lift = 0
+    if mood == "hop":
+        m = t % 0.9
+        lift = 2 if m < 0.3 else (1 if m < 0.42 else 0)
+    elif mood in ("wave", "idle"):
+        lift = 1 if int(t * (3 if mood == "wave" else 1.2)) % 2 else 0
+    return blink, wave, lift
+
+
+@functools.lru_cache(maxsize=128)
+def _mascot_sprite(scale, color, blink, wave, lift):
+    g = [row[:] for row in GRID]
     if blink:
         for y, x in EYES:
             g[y][x] = 1
-    if mood == "wave" and int(t * 4) % 2:
+    if wave:
         g[2][ARM_R] = 0
         g[1][ARM_R] = g[0][ARM_R] = 1
     h, w = len(g), len(g[0])
     small = Image.new("RGBA", (w, h + 2), (0, 0, 0, 0))
-    lift = 0
-    if mood == "hop":
-        lift = 2 if (t % 0.9) < 0.3 else (1 if (t % 0.9) < 0.42 else 0)
-    elif mood in ("wave", "idle"):
-        lift = 1 if int(t * (3 if mood == "wave" else 1.2)) % 2 else 0
     for y in range(h):
         for x in range(w):
             if g[y][x]:
                 small.putpixel((x, y + 2 - lift), color + (255,))
     # terminal cells are about twice as tall as wide: each banner pixel is 1 x 2
     return small.resize((w * scale, (h + 2) * scale * 2), Image.NEAREST)
+
+
+def mascot(scale, t, mood="idle", color=CLAUDE):
+    """Pixel mascot. mood: "wave" (needs you), "hop" (finished), "idle", "sleep"."""
+    return _mascot_sprite(scale, color, *_mascot_state(t, mood))
 
 
 SPIN = "·✢✳✶✻✽"
@@ -316,33 +356,218 @@ def ordered(sessions):
 
 
 # ---- the full Claude view ---------------------------------------------------------------------
-def render(W, H, sessions, g, c, t=None, tmux=None):
-    """sessions as pushed by the agent; g, c: GPU and CPU readings of the dashboard (may be None);
-    tmux: the window/pane layout pushed by the agent (drawn as a map when present)."""
-    t = time.time() if t is None else t
-    img = Image.new("RGBA", (W, H), BG + (255,))
+# Static elements (background, cards, glows per pulse level, wrapped titles, chips, window headers)
+# are rendered once into an RGB backdrop; each frame copies the backdrop and only pastes the moving
+# bits (spark, comet, spinners, mascot, check halo, elapsed time, GPU strip).
+_BODY_CACHE = collections.OrderedDict()
+_BODY_CACHE_MAX = 12
+
+
+def _paste(dst, src, xy):
+    dst.paste(src, xy, src)
+
+
+def _glow_level(t):
+    return 3 + round(4 * (0.5 + 0.5 * math.sin(t * 2 * math.pi / 1.8)))
+
+
+def _body_key(W, H, ss, tmux):
+    sk = tuple((s["id"], s["title"], s["project"], s["pos"], s["where"], s["state"]) for s in ss)
+    tk = (tuple((w["win"], w["name"], w["active"], w["w"], w["h"],
+                 tuple((p["pos"], p["x"], p["y"], p["w"], p["h"], p["cmd"], p["focus"]) for p in w["panes"]))
+                for w in tmux)
+          if tmux else None)
+    return (W, H, sk, tk)
+
+
+def _get_body(bkey, level, W, H, ss, tmux):
+    k = (bkey, level)
+    hit = _BODY_CACHE.get(k)
+    if hit is not None:
+        _BODY_CACHE.move_to_end(k)
+        return hit
+    val = _build_body(W, H, ss, tmux, level)
+    _BODY_CACHE[k] = val
+    while len(_BODY_CACHE) > _BODY_CACHE_MAX:
+        _BODY_CACHE.popitem(last=False)
+    return val
+
+
+def _build_body(W, H, ss, tmux, glow_level):
+    img = Image.new("RGB", (W, H), BG)
     d = Draw(img)
     pad = 26
-    ss = ordered(sessions)
-    _header(img, d, W, pad, ss, g, c, t)
+    slots = []
+    _header_left(d, pad, ss)
     top, bottom = 104, H - 20
     if not ss and not tmux:
-        _empty(img, d, W, H, t)
-        return img
-    by_pos = {s["pos"]: s for s in ss if s["where"] == "tmux" and s["pos"]}
+        m = _mascot_sprite(11, CLAUDE, True, False, 0)
+        _paste(img, m, ((W - m.width) // 2, H // 2 - 170))
+        d.text((W // 2, H // 2 + 20), "No Claude sessions", font=font("serif", 40, 500), fill=INK, anchor="ma")
+        d.text((W // 2, H // 2 + 78), "Start one in tmux and it will show up here", font=font("sans", 21, 400),
+               fill=MUTED, anchor="ma")
+        slots.append(("empty_z", W, H, m.width))
+        return img, slots
+    by_pos = {s["pos"]: i for i, s in enumerate(ss) if s["where"] == "tmux" and s["pos"]}
     lx = pad
     if tmux:
         mw = int((W - 2 * pad) * 0.56)
-        _map(img, d, pad, top, mw, bottom - top, tmux, by_pos, t)
+        _map(img, d, pad, top, mw, bottom - top, tmux, by_pos, ss, glow_level, slots)
         lx = pad + mw + 22
-    shown = [s for s in ss if s["state"] != "idle"]          # seen sessions stay out of the way
-    _list(img, d, lx, top, W - pad - lx, bottom - top, shown, ss, t)
-    return img
+    shown = [(i, s) for i, s in enumerate(ss) if s["state"] != "idle"]   # seen sessions stay out of the way
+    _list(img, d, lx, top, W - pad - lx, bottom - top, shown, ss, glow_level, slots)
+    return img, slots
 
 
-def _header(img, d, W, pad, ss, g, c, t):
+def _when_text(st, since, now, project, is_tile):
+    a = ago(since, now)
+    if st == "needs":
+        w = "waiting " + a
+    elif st == "done":
+        w = "just now" if a == "just now" else a + " ago"
+    elif st == "working":
+        w = a if is_tile else "working " + a
+    else:
+        w = "idle " + a
+    return w + (f" · {project}" if project else "")
+
+
+def render_if_changed(prev_key, W, H, sessions, g, c, t=None, tmux=None):
+    """Render the board, or return (None, key) if nothing visible changed since prev_key."""
+    now = time.time()
+    t = now if t is None else t
+    pad = 26
+    ss = ordered(sessions)
     busy = any(s["state"] == "working" for s in ss)
-    img.alpha_composite(spark(58, t, breathe=0.07 if busy else 0.0, spin=0.35 if busy else 0.08), (pad - 4, 20))
+    level = _glow_level(t) if any(s["state"] == "needs" for s in ss) else None
+    bkey = _body_key(W, H, ss, tmux)
+    clock = time.strftime("%H:%M")
+    gstrip = tuple(_gpu_strip(g, c))
+    sp_key = _spark_key(58, t, breathe=0.07 if busy else 0.0, spin=0.35 if busy else 0.0)
+
+    base, slots = _get_body(bkey, level, W, H, ss, tmux)
+    dyn_key = []
+    ops = []
+    for sl in slots:
+        kind = sl[0]
+        if kind == "comet":
+            _, x, y, w, h, off = sl
+            step = _comet_step(t + off)
+            dyn_key.append(step)
+            ops.append(("comet", x, y, w, h, step))
+        elif kind == "tile_icon":
+            _, x, y, w, h, ic, st, idx, sid_h = sl
+            s = ss[idx]
+            if st == "needs":
+                sc = max(2, ic // 17)
+                ms = _mascot_state(t + sid_h % 7 * 0.13, "wave")
+                dyn_key.append(ms)
+                ops.append(("mascot_br", x + w - 14, y + h - 12, sc, CLAUDE, ms))
+            elif st == "done":
+                ring = int((t * 6) % 9) if now - s["since"] < 90 else 0
+                dyn_key.append(ring)
+                ops.append(("check_br", x + w - 14, y + h - 12, ic, ring))
+            elif st == "working":
+                ch = spinner(t + sid_h % 10 * 0.07)
+                fsz = int(ic * 0.9)
+                dyn_key.append(ch)
+                ops.append(("text", (x + w - 16 - fsz // 2, y + h - 14 - fsz // 2), ch, font("sym", fsz), CLAUDE, "mm"))
+            else:
+                sc = max(2, ic // 20)
+                mood = "sleep" if now - s["since"] > 600 else "idle"
+                ms = _mascot_state(t, mood)
+                dyn_key.append(ms)
+                ops.append(("mascot_br", x + w - 14, y + h - 12, sc, (120, 116, 106), ms))
+        elif kind == "when":
+            _, tx, ty, maxw, anchor, fill, st, idx, is_tile = sl
+            s = ss[idx]
+            txt = _when_text(st, s["since"], now, s["project"], is_tile)
+            fwhen = font("sans", 20, 500)
+            fitted = _fit(txt, fwhen, round(maxw))
+            dyn_key.append(fitted)
+            ops.append(("text", (tx, ty), fitted, fwhen, fill, anchor))
+        elif kind == "item_icon":
+            _, x, cy, st, idx, sid_h = sl
+            s = ss[idx]
+            if st == "needs":
+                ms = _mascot_state(t + sid_h % 7 * 0.13, "wave")
+                dyn_key.append(ms)
+                ops.append(("mascot_item", x + 30, cy, 3, CLAUDE, ms))
+            elif st == "done":
+                ring = int((t * 6) % 9) if now - s["since"] < 90 else 0
+                dyn_key.append(ring)
+                ops.append(("check_xy", x + 28, cy - 28, 56, ring))
+            elif st == "working":
+                ch = spinner(t + sid_h % 10 * 0.07)
+                dyn_key.append(ch)
+                ops.append(("text", (x + 56, cy), ch, font("sym", 40), CLAUDE, "mm"))
+        elif kind == "hero_mascot":
+            _, x, y, w, h = sl
+            sc = 7 if w > 600 else 6
+            ms = _mascot_state(t, "idle")
+            dyn_key.append(ms)
+            ops.append(("mascot_hero", x, y, w, h, sc, ms))
+        elif kind == "empty_z":
+            _, ew, eh, mw = sl
+            zs = tuple(round(((t * 0.45 + i / 3) % 1.0) * 40) % 40 for i in range(3))
+            dyn_key.append(zs)
+            ops.append(("empty_z", ew, eh, mw, zs))
+
+    frame_key = (bkey, level, clock, gstrip, sp_key, tuple(dyn_key))
+    if prev_key is not None and frame_key == prev_key:
+        return None, frame_key
+
+    img = base.copy()
+    d = Draw(img)
+    strip, sx, sy = _header_right(W, pad, clock, gstrip)
+    img.paste(strip, (sx, sy))
+    _paste(img, _spark_cached(*sp_key), (pad - 4, 20))
+    for op in ops:
+        k = op[0]
+        if k == "comet":
+            _, x, y, w, h, step = op
+            sp, ox, oy = _comet_sprite(w, h, CLAUDE, step)
+            _paste(img, sp, (x + ox, y + oy))
+        elif k == "mascot_br":
+            _, rx, by, sc, col, ms = op
+            m = _mascot_sprite(sc, col, *ms)
+            _paste(img, m, (rx - m.width, by - m.height))
+        elif k == "check_br":
+            _, rx, by, ic, ring = op
+            m = check_icon(ic, DONE, ring)
+            _paste(img, m, (rx - m.width, by - m.height))
+        elif k == "mascot_item":
+            _, ix, cy, sc, col, ms = op
+            m = _mascot_sprite(sc, col, *ms)
+            _paste(img, m, (ix, cy - m.height // 2))
+        elif k == "check_xy":
+            _, ix, iy, sz, ring = op
+            _paste(img, check_icon(sz, DONE, ring), (ix, iy))
+        elif k == "mascot_hero":
+            _, x, y, w, h, sc, ms = op
+            m = _mascot_sprite(sc, CLAUDE, *ms)
+            _paste(img, m, (x + (w - m.width) // 2, y + h // 2 - m.height - 40))
+        elif k == "text":
+            _, xy, txt, f, fill, anchor = op
+            d.text(xy, txt, font=f, fill=fill, anchor=anchor)
+        elif k == "empty_z":
+            _, ew, eh, mw, zs = op
+            for step in zs:
+                p = step / 40.0
+                f = font("serif", int(22 + 18 * p), 500)
+                a = (1 - p) * min(1, p * 4)
+                zx, zy = ew // 2 + mw // 2 - 10 + int(40 * p), eh // 2 - 170 - int(90 * p)
+                d.text((zx, zy), "z", font=f, fill=mix(BG, MUTED, a))
+    return img, frame_key
+
+
+def render(W, H, sessions, g, c, t=None, tmux=None):
+    """sessions as pushed by the agent; g, c: GPU and CPU readings of the dashboard (may be None);
+    tmux: the window/pane layout pushed by the agent (drawn as a map when present)."""
+    return render_if_changed(None, W, H, sessions, g, c, t=t, tmux=tmux)[0]
+
+
+def _header_left(d, pad, ss):
     fw = font("serif", 48, 600)
     d.text((pad + 64, 20), "Claude", font=fw, fill=INK)
     x = pad + 64 + d.textlength("Claude", font=fw) + 22
@@ -357,23 +582,38 @@ def _header(img, d, W, pad, ss, g, c, t):
             d.text((x, 48), "·", font=fs, fill=MUTED, anchor="lm"); x += 18
         d.text((x, 48), txt, font=fs, fill=col, anchor="lm")
         x += d.textlength(txt, font=fs) + 14
-    clock = time.strftime("%H:%M")
+
+
+@functools.lru_cache(maxsize=16)
+def _header_right(W, pad, clock, gstrip):
     fc = font("sans", 38, 600)
-    d.text((W - pad, 48), clock, font=fc, fill=INK, anchor="rm")
-    x = W - pad - d.textlength(clock, font=fc) - 22
     fl, fv = font("sans", 18, 500), font("sans", 22, 650)
-    for label, val in reversed(_gpu_strip(g, c)):
-        wl = d.textlength(label, font=fl) + (8 if label else 0)
-        wv = d.textlength(val, font=fv)
+    cw = _length(fc, clock)
+    x = W - pad - cw - 22
+    pills = []
+    min_x = W - pad - cw - 4
+    for label, val in reversed(gstrip):
+        wl = _length(fl, label) + (8 if label else 0)
+        wv = _length(fv, val)
         pw = int(wl + wv + 30)
         if x - pw < 560:
             break
         x -= pw
-        img.alpha_composite(rrect(pw, 42, 21, CARD), (int(x), 27))
-        if label:
-            d.text((x + 15, 48), label, font=fl, fill=MUTED, anchor="lm")
-        d.text((x + 15 + wl, 48), val, font=fv, fill=INK, anchor="lm")
+        pills.append((x, pw, wl, label, val))
+        min_x = x
         x -= 10
+    x0 = max(0, int(min_x) - 2)
+    x1 = min(W, W - pad + 4)
+    y0, h = 20, 56
+    strip = Image.new("RGB", (max(1, x1 - x0), h), BG)
+    d = Draw(strip)
+    d.text((W - pad - x0, 48 - y0), clock, font=fc, fill=INK, anchor="rm")
+    for px, pw, wl, label, val in pills:
+        _paste(strip, rrect(pw, 42, 21, CARD), (int(px) - x0, 27 - y0))
+        if label:
+            d.text((px - x0 + 15, 48 - y0), label, font=fl, fill=MUTED, anchor="lm")
+        d.text((px - x0 + 15 + wl, 48 - y0), val, font=fv, fill=INK, anchor="lm")
+    return strip, x0, y0
 
 
 def mix(a, b, k):
@@ -398,25 +638,50 @@ def wrap(d, text, f, maxw, lines):
     return out
 
 
-def comet(img, x, y, w, h, t, color, period=2.4):
-    """A bright dot running around a tile's edge with a fading tail (the "working" animation)."""
-    layer = Image.new("RGBA", (w + 16, h + 16), (0, 0, 0, 0))
-    ld = Draw(layer)
+COMET_STEPS = 60             # quantized perimeter positions per loop (2.4 s -> 25 steps/s)
+
+
+def _comet_step(t, period=2.4):
+    return round(((t / period) % 1.0) * COMET_STEPS) % COMET_STEPS
+
+
+@functools.lru_cache(maxsize=512)
+def _comet_sprite(w, h, color, step):
+    """Tight bounding-box sprite for one quantized comet position around a (w x h) tile."""
     per = 2 * (w + h)
     N = 46
+    base = (step / COMET_STEPS) * per
+    pts = []
     for i in range(N):
-        p = ((t / period) % 1.0 * per - i * per * 0.0045) % per
-        if p < w: px, py = p, 0
-        elif p < w + h: px, py = w, p - w
-        elif p < 2 * w + h: px, py = w - (p - w - h), h
-        else: px, py = 0, h - (p - 2 * w - h)
-        px, py = min(max(px, 1), w - 1) + 8, min(max(py, 1), h - 1) + 8
+        p = (base - i * per * 0.0045) % per
+        if p < w: px, py = p, 0.0
+        elif p < w + h: px, py = float(w), p - w
+        elif p < 2 * w + h: px, py = w - (p - w - h), float(h)
+        else: px, py = 0.0, h - (p - 2 * w - h)
+        px, py = min(max(px, 1.0), w - 1.0), min(max(py, 1.0), h - 1.0)
         r = 3.6 * (1 - i / (N + 8))
-        ld.ellipse([px - r, py - r, px + r, py + r], fill=color + (int(255 * (1 - i / N) ** 1.5),))
-    img.alpha_composite(layer.filter(ImageFilter.GaussianBlur(1.2)), (x - 8, y - 8))
+        pts.append((px, py, r, int(255 * (1 - i / N) ** 1.5)))
+    bx0 = max(-8, int(min(px - r for px, py, r, _ in pts)) - 5)
+    by0 = max(-8, int(min(py - r for px, py, r, _ in pts)) - 5)
+    bx1 = min(w + 8, int(math.ceil(max(px + r for px, py, r, _ in pts))) + 5)
+    by1 = min(h + 8, int(math.ceil(max(py + r for px, py, r, _ in pts))) + 5)
+    layer = Image.new("RGBA", (bx1 - bx0, by1 - by0), (0, 0, 0, 0))
+    ld = ImageDraw.Draw(layer)
+    for px, py, r, a in pts:
+        ld.ellipse([px - bx0 - r, py - by0 - r, px - bx0 + r, py - by0 + r], fill=color + (a,))
+    return layer.filter(ImageFilter.GaussianBlur(1.2)), bx0, by0
 
 
-def _map(img, d, x, y, w, h, windows, by_pos, t):
+def comet(img, x, y, w, h, t, color, period=2.4):
+    """A bright dot running around a tile's edge with a fading tail (the "working" animation)."""
+    sp, ox, oy = _comet_sprite(w, h, color, _comet_step(t, period))
+    if img.mode == "RGBA":
+        img.alpha_composite(sp, (x + ox, y + oy))
+    else:
+        _paste(img, sp, (x + ox, y + oy))
+
+
+def _map(img, d, x, y, w, h, windows, by_pos, ss, glow_level, slots):
     """The tmux windows, each with its panes laid out as on the terminal, coloured by state."""
     head = 34
     rows = [max(1, len({p["y"] for p in win["panes"]})) for win in windows]
@@ -441,16 +706,17 @@ def _map(img, d, x, y, w, h, windows, by_pos, t):
         for p in win["panes"]:
             x0, y0 = x + p["x"] * sx, cy + head + p["y"] * sy
             x1, y1 = x + min(win["w"], p["x"] + p["w"] + 1) * sx, cy + head + min(win["h"], p["y"] + p["h"] + 1) * sy
-            _tile(img, d, int(x0) + 3, int(y0) + 3, int(x1 - x0) - 6, int(y1 - y0) - 6, p, by_pos.get(p["pos"]), t)
+            idx = by_pos.get(p["pos"])
+            _tile(img, d, int(x0) + 3, int(y0) + 3, int(x1 - x0) - 6, int(y1 - y0) - 6,
+                  p, idx, ss[idx] if idx is not None else None, glow_level, slots)
         cy += head + wh + gap
 
 
-def _tile(img, d, x, y, w, h, p, s, t):
-    now = time.time()
+def _tile(img, d, x, y, w, h, p, idx, s, glow_level, slots):
     st = s["state"] if s else None
     r = 18
     if st is None:                                          # not a Claude pane
-        img.alpha_composite(rrect(w, h, r, (35, 34, 32), (52, 50, 46), 1), (x, y))
+        _paste(img, rrect(w, h, r, (35, 34, 32), (52, 50, 46), 1), (x, y))
         d.text((x + 18, y + 14), p["pos"], font=font("sans", 30, 700), fill=MUTED)
         d.text((x + 18, y + 54), p["cmd"] or "shell", font=font("sans", 21, 500), fill=(110, 107, 99))
         if p["focus"]:
@@ -458,16 +724,16 @@ def _tile(img, d, x, y, w, h, p, s, t):
         return
     col = STATE_COL[st]
     if st == "needs":
-        level = 3 + round(4 * (0.5 + 0.5 * math.sin(t * 2 * math.pi / 1.8)))
-        img.alpha_composite(glow(w, h, r, CLAUDE, 12, level), (x - 24, y - 24))
+        _paste(img, glow(w, h, r, CLAUDE, 12, glow_level), (x - 24, y - 24))
         fill = mix(BG, CLAUDE, 0.24)
     elif st == "done":
         fill = mix(BG, DONE, 0.17)
     else:
         fill = CARD_HI if st == "working" else CARD
-    img.alpha_composite(rrect(w, h, r, fill, col + ((200,) if st != "idle" else (60,)), 2), (x, y))
+    _paste(img, rrect(w, h, r, fill, col + ((200,) if st != "idle" else (60,)), 2), (x, y))
+    sid_h = hash(s["id"])
     if st == "working":
-        comet(img, x, y, w, h, t + hash(s["id"]) % 10 * 0.23, CLAUDE)
+        slots.append(("comet", x, y, w, h, sid_h % 10 * 0.23))
 
     # top: position + state label
     d.text((x + 18, y + 12), p["pos"], font=font("sans", 32, 700), fill=INK if st != "idle" else INK2)
@@ -475,32 +741,24 @@ def _tile(img, d, x, y, w, h, p, s, t):
     if p["focus"]:
         _here(d, x, y, p["pos"])
 
-    # icon, bottom right
+    # icon, bottom right (drawn dynamically on top of the backdrop)
     ic = int(min(h * 0.42, w * 0.3, 96))
     icon_w = 0
     if ic >= 34:
         if st == "needs":
-            m = mascot(max(2, ic // 17), t + hash(s["id"]) % 7 * 0.13, "wave")
+            icon_w = len(GRID[0]) * max(2, ic // 17)
         elif st == "done":
-            ring = int((t * 6) % 9) if now - s["since"] < 90 else 0
-            m = check_icon(ic, DONE, ring)
+            icon_w = ic
         elif st == "working":
-            m = None
-            fsz = int(ic * 0.9)
-            d.text((x + w - 16 - fsz // 2, y + h - 14 - fsz // 2), spinner(t + hash(s["id"]) % 10 * 0.07),
-                   font=font("sym", fsz), fill=CLAUDE, anchor="mm")
-            icon_w = fsz
+            icon_w = int(ic * 0.9)
         else:
-            m = mascot(max(2, ic // 20), t, "sleep" if now - s["since"] > 600 else "idle", color=(120, 116, 106))
-        if m is not None:
-            img.alpha_composite(m, (x + w - 14 - m.width, y + h - 12 - m.height))
-            icon_w = m.width
+            icon_w = len(GRID[0]) * max(2, ic // 20)
+        slots.append(("tile_icon", x, y, w, h, ic, st, idx, sid_h))
 
     # title (wrapped) and time
     title = s["title"] or s["project"] or "Claude session"
     ft = font("serif", 27 if h >= 150 else 24, 600)
     ty, lh = y + 58, (35 if h >= 150 else 31)
-    fwhen = font("sans", 20, 500)
     when_y = y + h - 34
     n_lines = max(0, min(3, (when_y - ty - 4) // lh))
     if n_lines == 0 and h >= 70:                            # short tile: title beside the position
@@ -511,11 +769,8 @@ def _tile(img, d, x, y, w, h, p, s, t):
     else:
         for i, line in enumerate(wrap(d, title, ft, w - 36 - (icon_w if i_overlaps(ty, lh, n_lines, y, h, ic) else 0), n_lines)):
             d.text((x + 18, ty + i * lh), line, font=ft, fill=INK if st != "idle" else INK2)
-    when = {"needs": "waiting " + ago(s["since"], now), "done": ago(s["since"], now) + " ago",
-            "working": ago(s["since"], now), "idle": "idle " + ago(s["since"], now)}[st].replace("just now ago", "just now")
     if h >= 70:
-        d.text((x + 18, when_y), fit(d, when + (f" · {s['project']}" if s["project"] else ""), fwhen, w - 50 - icon_w),
-               font=fwhen, fill=col if st in ("needs", "done") else MUTED)
+        slots.append(("when", x + 18, when_y, w - 50 - icon_w, None, col if st in ("needs", "done") else MUTED, st, idx, True))
 
 
 def i_overlaps(ty, lh, n, y, h, ic):
@@ -528,11 +783,10 @@ def _here(d, x, y, pos):
     d.ellipse([px, y + 30, px + 10, y + 40], fill=INK)
 
 
-def _list(img, d, x, y, w, h, shown, ss, t):
+def _list(img, d, x, y, w, h, shown, ss, glow_level, slots):
     """Sessions that need attention or are busy (and the ones outside tmux), large and readable."""
     if not shown:                                           # nothing going on: a calm hero
-        m = mascot(7 if w > 600 else 6, t, "idle")
-        img.alpha_composite(m, (x + (w - m.width) // 2, y + h // 2 - m.height - 40))
+        slots.append(("hero_mascot", x, y, w, h))
         d.text((x + w // 2, y + h // 2), "All caught up", font=font("serif", 42, 600), fill=INK, anchor="ma")
         d.text((x + w // 2, y + h // 2 + 58), "Nothing needs you right now" if ss else "No Claude sessions yet",
                font=font("sans", 22, 500), fill=MUTED, anchor="ma")
@@ -540,15 +794,15 @@ def _list(img, d, x, y, w, h, shown, ss, t):
         return
     gap = 12
     big = 128 if len(shown) <= 4 else 108
-    hs = [big if s["state"] in ("needs", "done") else big - 20 for s in shown]
+    hs = [big if s["state"] in ("needs", "done") else big - 20 for _, s in shown]
     n = len(shown)
     while n and sum(hs[:n]) + gap * (n - 1) > h:
         n -= 1
     if n < len(shown) and n:
         n -= 1 if sum(hs[:n]) + gap * n + 34 > h else 0
     cy = y
-    for s, ih in zip(shown[:n], hs[:n]):
-        _item(img, d, x, cy, w, ih, s, t)
+    for (idx, s), ih in zip(shown[:n], hs[:n]):
+        _item(img, d, x, cy, w, ih, idx, s, glow_level, slots)
         cy += ih + gap
     if n < len(shown):
         d.text((x + w // 2, cy + 2), f"+ {len(shown) - n} more", font=font("sans", 20, 600), fill=MUTED, anchor="ma")
@@ -570,24 +824,17 @@ def _idle_note(d, x, y, w, bottom, ss):
     d.text((x + 8, max(y + 4, bottom - 30) if y < bottom - 60 else y + 4), fit(d, txt, f, w - 16), font=f, fill=MUTED)
 
 
-def _item(img, d, x, y, w, h, s, t):
-    st, now = s["state"], time.time()
+def _item(img, d, x, y, w, h, idx, s, glow_level, slots):
+    st = s["state"]
     col = STATE_COL[st]
     if st == "needs":
-        level = 3 + round(4 * (0.5 + 0.5 * math.sin(t * 2 * math.pi / 1.8)))
-        img.alpha_composite(glow(w, h, 18, CLAUDE, 10, level), (x - 20, y - 20))
+        _paste(img, glow(w, h, 18, CLAUDE, 10, glow_level), (x - 20, y - 20))
     fill = {"needs": mix(BG, CLAUDE, 0.22), "done": mix(BG, DONE, 0.14)}.get(st, CARD)
-    img.alpha_composite(rrect(w, h, 18, fill), (x, y))
-    img.alpha_composite(rrect(6, h - 32, 3, col), (x + 12, y + 16))
+    _paste(img, rrect(w, h, 18, fill), (x, y))
+    _paste(img, rrect(6, h - 32, 3, col), (x + 12, y + 16))
     cy = y + h // 2
-    # icon column
-    if st == "needs":
-        m = mascot(3, t + hash(s["id"]) % 7 * 0.13, "wave")
-        img.alpha_composite(m, (x + 30, cy - m.height // 2))
-    elif st == "done":
-        img.alpha_composite(check_icon(56, DONE, int((t * 6) % 9) if now - s["since"] < 90 else 0), (x + 28, cy - 28))
-    elif st == "working":
-        d.text((x + 56, cy), spinner(t + hash(s["id"]) % 10 * 0.07), font=font("sym", 40), fill=CLAUDE, anchor="mm")
+    if st in ("needs", "done", "working"):
+        slots.append(("item_icon", x, cy, st, idx, hash(s["id"])))
     else:
         d.ellipse([x + 49, cy - 7, x + 63, cy + 7], fill=MUTED)
     tx = x + 96
@@ -600,12 +847,8 @@ def _item(img, d, x, y, w, h, s, t):
         d.text((tx, ty + i * 36), line, font=ft, fill=INK)
     my = ty + th + 6
     cw = _chip(img, d, tx, my, place(s), col if st != "idle" else MUTED)
-    when = {"needs": "waiting " + ago(s["since"], now), "done": ago(s["since"], now) + " ago",
-            "working": "working " + ago(s["since"], now), "idle": "idle " + ago(s["since"], now)}[st]
-    when = when.replace("just now ago", "just now")
-    fm = font("sans", 20, 500)
-    d.text((tx + cw + 12, my + 17), fit(d, when + (f" · {s['project']}" if s["project"] else ""), fm, x + w - 20 - tx - cw - 12),
-           font=fm, fill=col if st in ("needs", "done") else MUTED, anchor="lm")
+    slots.append(("when", tx + cw + 12, my + 17, x + w - 20 - tx - cw - 12, "lm",
+                  col if st in ("needs", "done") else MUTED, st, idx, False))
 
 
 def _gpu_strip(g, c):
@@ -619,24 +862,10 @@ def _gpu_strip(g, c):
     return out
 
 
-def _empty(img, d, W, H, t):
-    m = mascot(11, t, "sleep")
-    img.alpha_composite(m, ((W - m.width) // 2, H // 2 - 170))
-    for i in range(3):                                      # drifting z's
-        p = (t * 0.45 + i / 3) % 1.0
-        f = font("serif", int(22 + 18 * p), 500)
-        a = int(255 * (1 - p) * min(1, p * 4))
-        zx, zy = W // 2 + m.width // 2 - 10 + int(40 * p), H // 2 - 170 - int(90 * p)
-        d.text((zx, zy), "z", font=f, fill=MUTED + (a,))
-    d.text((W // 2, H // 2 + 20), "No Claude sessions", font=font("serif", 40, 500), fill=INK, anchor="ma")
-    d.text((W // 2, H // 2 + 78), "Start one in tmux and it will show up here", font=font("sans", 21, 400),
-           fill=MUTED, anchor="ma")
-
-
 def _chip(img, d, x, y, text, col):
     f = font("sans", 19, 650)
     w = int(d.textlength(text, font=f) + 24)
-    img.alpha_composite(rrect(w, 34, 17, col + (46,)), (int(x), int(y)))
+    _paste(img, rrect(w, 34, 17, col + (46,)), (int(x), int(y)))
     d.text((x + w / 2, y + 17), text, font=f, fill=col, anchor="mm")
     return w
 
@@ -653,10 +882,7 @@ def badge(img, right, y, sessions, t):
     tw = d.textlength(text, font=f)
     w = int(tw + 62)
     x = int(right - w)
-    base = img.convert("RGBA")
-    base.alpha_composite(rrect(w, 38, 19, CARD_HI), (x, y))
+    _paste(img, rrect(w, 38, 19, CARD_HI), (x, y))
     sp = spark(26, t, breathe=0.08 if n else 0, spin=0.4 if n else 0.05)
-    base.alpha_composite(sp, (x + 12, y + 6))
-    img.paste(base)
-    d = Draw(img)
+    _paste(img, sp, (x + 12, y + 6))
     d.text((x + 46, y + 19), text, font=f, fill=INK if n else INK2, anchor="lm")
