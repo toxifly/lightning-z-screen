@@ -69,13 +69,17 @@ class Board:
         with self.lock:
             self.sessions, self.windows, self.at = clean, windows, time.monotonic()
 
-    def snapshot(self):
+    def state(self):
         with self.lock:
-            return [] if time.monotonic() - self.at > STALE else list(self.sessions)
+            if time.monotonic() - self.at > STALE:
+                return [], []
+            return list(self.sessions), list(self.windows)
+
+    def snapshot(self):
+        return self.state()[0]
 
     def layout(self):
-        with self.lock:
-            return [] if time.monotonic() - self.at > STALE else list(self.windows)
+        return self.state()[1]
 
     def attention(self):
         return any(s["state"] in ("needs", "done") for s in self.snapshot())
@@ -866,10 +870,10 @@ def _gpu_strip(g, c):
     out = []
     if g:
         if g.get("temp") is not None: out.append(("GPU", f"{g['temp']:.0f}°C"))
-        if g.get("power") is not None: out.append(("", f"{g['power']:.0f} W"))
-        if g.get("load") is not None: out.append(("load", f"{g['load']:.0f}%"))
+        if g.get("power") is not None: out.append(("", f"{round(g['power'] / 5) * 5:.0f} W"))
+        if g.get("load") is not None: out.append(("load", f"{round(g['load'] / 5) * 5:.0f}%"))
     if c and c.get("temp") is not None:
-        out.append(("CPU", f"{c['temp']:.0f}°C"))
+        out.append(("CPU", f"{round(c['temp'] / 2) * 2:.0f}°C"))
     return out
 
 

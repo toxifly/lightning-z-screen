@@ -28,7 +28,7 @@ def font(size, bold=False):
     return ImageFont.truetype(os.path.join(FONT_DIR, "DejaVuSans-Bold.ttf" if bold else "DejaVuSans.ttf"), size)
 
 F = dict(title=font(30, True), label=font(22), small=font(18), value=font(34, True),
-         hero=font(96, True), unit=font(30), status=font(20, True))
+         hero=font(96, True), unit=font(30), status=font(20, True), badge=font(16, True))
 
 # pin rating for 12V-2x6 is 9.5 A; warn early
 PIN_WARN_A, PIN_CRIT_A = 8.0, 9.5
@@ -140,7 +140,7 @@ def badge(d, xy, st):
     label, col = st
     x, y = xy
     d.polygon([(x, y + 22), (x + 12, y), (x + 24, y + 22)], fill=col)           # warning triangle
-    d.text((x + 12, y + 13), "!", font=font(16, True), fill=SURFACE, anchor="mm")
+    d.text((x + 12, y + 13), "!", font=F["badge"], fill=SURFACE, anchor="mm")
     d.text((x + 32, y + 11), label, font=F["status"], fill=INK, anchor="lm")
 
 def meter(d, x, y, w, name, frac, value_txt, col=ACCENT):
@@ -179,7 +179,7 @@ HIST = 120  # samples (~60 s at 2 fps)
 
 def render(W, H, gpu_name, g, c, wv, hist):
     img = Image.new("RGB", (W, H), SURFACE)
-    d = ImageDraw.Draw(img)
+    d = claude_board.Draw(img)
     pad = 24
 
     # header
@@ -261,8 +261,8 @@ class Dashboard:
     done = False
     FADE = 0.5                           # seconds of cross-fade between the two views
     HOLD = 20                            # seconds the board stays up after the last active session
-    CLAUDE_GPU_POLL = 10.0               # seconds between NVML/CPU polls while on the Claude board
-    JPEG_CACHE_MAX = 32                  # cached JPEG frames (~3.5 MB) for the 2 s animated loop
+    CLAUDE_GPU_POLL = 30.0               # seconds between NVML/CPU polls while on the Claude board
+    JPEG_CACHE_MAX = 96                  # cached JPEG frames (~11 MB): holds 4 loops across GPU/temp jitter
 
     def __init__(self, gpu, cpu, wv, hist, w, h, rotate, fps, quality, board=None):
         self.gpu, self.cpu, self.wv, self.hist = gpu, cpu, wv, hist
@@ -288,35 +288,37 @@ class Dashboard:
     def _wh(self):
         return self.size[::-1] if self.rotate in (90, 270) else self.size
 
-    def gpu_frame(self):
+    def gpu_frame(self, ss=None):
         g, c = self.read()
         W, H = self._wh()
         wv = {n: self.wv.data[n] for n, _ in self.wv.devs if n in self.wv.data} if self.wv else {}
         img = render(W, H, self.gpu.name, g, c, wv, self.hist)
         if self.board:
-            clock_w = ImageDraw.Draw(img).textlength(time.strftime("%H:%M"), font=F["title"])
-            claude_board.badge(img, W - 24 - clock_w - 20, 18, self.board.snapshot(), time.time())
+            clock_w = claude_board._length(F["title"], time.strftime("%H:%M"))
+            claude_board.badge(img, W - 24 - clock_w - 20, 18, self.board.snapshot() if ss is None else ss, time.time())
         return img
 
     def claude_frame(self):
         g, c = self.read(self.CLAUDE_GPU_POLL)
         W, H = self._wh()
-        return claude_board.render(W, H, self.board.snapshot(), g, c, tmux=self.board.layout())
+        ss, tmux = self.board.state()
+        return claude_board.render(W, H, ss, g, c, tmux=tmux)
 
     def image(self):
         img = self.gpu_frame()
         return img.rotate(-self.rotate, expand=True) if self.rotate else img
 
     def next(self, timeout):
-        claude = False
+        claude, ss, tmux = False, [], []
         if self.board:
-            if self.board.active():
+            ss, tmux = self.board.state()
+            if any(s["state"] in ("working", "needs", "done") for s in ss):
                 self.active_at = time.monotonic()
             claude = self.force or time.monotonic() - self.active_at < self.HOLD
         if self.fade:
             period = 1.0 / claude_board.FPS
         elif claude:
-            period = 1.0 / claude_board.fps(self.board.snapshot())
+            period = 1.0 / claude_board.fps(ss)
         else:
             period = self.period
         time.sleep(max(0.0, self.due - time.monotonic()))
@@ -325,7 +327,7 @@ class Dashboard:
         if claude:
             g, c = self.read(self.CLAUDE_GPU_POLL)
             W, H = self._wh()
-            key, draw = claude_board.plan(W, H, self.board.snapshot(), g, c, tmux=self.board.layout())
+            key, draw = claude_board.plan(W, H, ss, g, c, tmux=tmux)
             if self.view == "claude" and not self.fade:
                 if key == self._claude_key:
                     return None          # nothing visible changed; caller repeats last JPEG every 2 s
@@ -340,7 +342,7 @@ class Dashboard:
             img = draw()
         else:
             self._claude_key = None
-            img = self.gpu_frame()
+            img = self.gpu_frame(ss)
         view = "claude" if claude else "gpu"
         now = time.monotonic()
         if view != self.view:

@@ -70,8 +70,12 @@ class Screen:
 
     def send_jpeg(self, jpg: bytes):
         self.dev.write(EP_OUT, _hdr(FRAME_MAGIC, len(jpg), self.fid, self.fmt), timeout=5000)
-        for o in range(0, len(jpg), CHUNK):
-            self.dev.write(EP_OUT, jpg[o:o + CHUNK], timeout=10000)
+        if len(jpg) <= CHUNK:
+            self.dev.write(EP_OUT, jpg, timeout=10000)
+        else:
+            mv = memoryview(jpg)
+            for o in range(0, len(jpg), CHUNK):
+                self.dev.write(EP_OUT, mv[o:o + CHUNK], timeout=10000)
         self.fid += 1
 
     def send_image(self, img, quality=85):
