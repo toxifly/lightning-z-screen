@@ -20,7 +20,8 @@ from PIL import Image, ImageDraw, ImageFilter, ImageFont
 HERE = os.path.dirname(os.path.abspath(__file__))
 FONT_DIR = os.path.join(HERE, "fonts")
 DEJAVU = "/usr/share/fonts/truetype/dejavu/"
-FPS = 12                     # frame rate while this view is on screen (animations)
+FPS = 12                     # frame rate while a session is working (comet, spinners)
+CALM_FPS = 2                 # frame rate otherwise: needs/done/idle tiles barely move
 STALE = 30                   # seconds without a push from the agent before the list is dropped
 
 # ---- Claude palette (dark, warm) ---------------------------------------------------------------
@@ -114,6 +115,45 @@ def font(kind, size, weight=400):
     return f
 
 
+# ---- cached text --------------------------------------------------------------------------------
+# The board redraws the same titles and labels every frame; rasterising them was ~70% of the frame
+# time. Draw keeps each (font, text, anchor) as a ready glyph mask and only blits it.
+class Draw(ImageDraw.ImageDraw):
+    def textlength(self, text, font=None, *a, **k):
+        if a or k or font is None or not isinstance(text, str):
+            return super().textlength(text, font, *a, **k)
+        return _length(font, text)
+
+    def text(self, xy, text, fill=None, font=None, anchor=None, *a, **k):
+        if a or k or font is None or not isinstance(text, str) or "\n" in text:
+            return super().text(xy, text, fill, font, anchor, *a, **k)
+        m, ox, oy = _glyphs(font, text, anchor)
+        if m is not None:
+            self.bitmap((round(xy[0]) + ox, round(xy[1]) + oy), m, fill)
+
+
+@functools.lru_cache(maxsize=4096)
+def _length(f, text):
+    return f.getlength(text)
+
+
+@functools.lru_cache(maxsize=2048)
+def _glyphs(f, text, anchor):
+    """(mask, dx, dy): text drawn at (x, y) with this anchor covers mask placed at (x + dx, y + dy)."""
+    x0, y0, x1, y1 = f.getbbox(text, anchor=anchor)
+    if x1 <= x0 or y1 <= y0:
+        return None, 0, 0
+    p = 2                                           # anti-aliasing can spill past the box
+    m = Image.new("L", (x1 - x0 + 2 * p, y1 - y0 + 2 * p))
+    ImageDraw.Draw(m).text((p - x0, p - y0), text, fill=255, font=f, anchor=anchor)
+    return m, x0 - p, y0 - p
+
+
+def fps(sessions):
+    """Frame rate for the board: smooth only while something is working."""
+    return FPS if any(s["state"] == "working" for s in sessions) else CALM_FPS
+
+
 def fit(d, text, f, maxw):
     """text shortened with an ellipsis to fit maxw pixels."""
     if d.textlength(text, font=f) <= maxw:
@@ -158,7 +198,7 @@ def check_icon(size, color, ring):
     """A round check mark; ring (0-8) is the pulse of an outer halo."""
     S = size * SS
     img = Image.new("RGBA", (S, S), (0, 0, 0, 0))
-    d = ImageDraw.Draw(img)
+    d = Draw(img)
     c, r = S / 2, S * 0.36
     if ring:
         rr = r + (S * 0.49 - r) * ring / 8
@@ -180,7 +220,7 @@ RAYS = ((0, 1.00), (31, .80), (59, .94), (91, .73), (120, .98), (151, .83),
 def spark(size, t, color=CLAUDE, breathe=0.0, spin=0.12):
     S = size * SS
     img = Image.new("RGBA", (S, S), (0, 0, 0, 0))
-    d = ImageDraw.Draw(img)
+    d = Draw(img)
     c, R, w0 = S / 2, S * 0.48, S * 0.095
     rot = t * spin
     for i, (deg, ln) in enumerate(RAYS):
@@ -281,7 +321,7 @@ def render(W, H, sessions, g, c, t=None, tmux=None):
     tmux: the window/pane layout pushed by the agent (drawn as a map when present)."""
     t = time.time() if t is None else t
     img = Image.new("RGBA", (W, H), BG + (255,))
-    d = ImageDraw.Draw(img)
+    d = Draw(img)
     pad = 26
     ss = ordered(sessions)
     _header(img, d, W, pad, ss, g, c, t)
@@ -361,7 +401,7 @@ def wrap(d, text, f, maxw, lines):
 def comet(img, x, y, w, h, t, color, period=2.4):
     """A bright dot running around a tile's edge with a fading tail (the "working" animation)."""
     layer = Image.new("RGBA", (w + 16, h + 16), (0, 0, 0, 0))
-    ld = ImageDraw.Draw(layer)
+    ld = Draw(layer)
     per = 2 * (w + h)
     N = 46
     for i in range(N):
@@ -606,7 +646,7 @@ def badge(img, right, y, sessions, t):
     """'✻ 2 working' (or 'Claude · 3 idle') next to the dashboard clock; returns nothing."""
     if not sessions:
         return
-    d = ImageDraw.Draw(img)
+    d = Draw(img)
     n = sum(s["state"] == "working" for s in sessions)
     text = f"{n} working" if n else f"{len(sessions)} idle"
     f = font("sans", 20, 600)
@@ -618,5 +658,5 @@ def badge(img, right, y, sessions, t):
     sp = spark(26, t, breathe=0.08 if n else 0, spin=0.4 if n else 0.05)
     base.alpha_composite(sp, (x + 12, y + 6))
     img.paste(base)
-    d = ImageDraw.Draw(img)
+    d = Draw(img)
     d.text((x + 46, y + 19), text, font=f, fill=INK if n else INK2, anchor="lm")

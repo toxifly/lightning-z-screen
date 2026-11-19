@@ -257,7 +257,7 @@ class Dashboard:
 
     With a Claude board it doubles as the Claude sessions view: while a session is working, needs an
     answer or has finished unseen (and HOLD seconds after; or always, with force=True, i.e. the "claude" mode) it shows the board
-    instead, animated at claude_board.FPS, with the GPU numbers as a strip in its header."""
+    instead, animated at claude_board.fps() (smooth only while a session works), with the GPU numbers as a strip in its header."""
     done = False
     FADE = 0.5                           # seconds of cross-fade between the two views
     HOLD = 20                            # seconds the board stays up after the last active session
@@ -308,7 +308,12 @@ class Dashboard:
             if self.board.active():
                 self.active_at = time.monotonic()
             claude = self.force or time.monotonic() - self.active_at < self.HOLD
-        period = 1.0 / claude_board.FPS if (claude or self.fade) else self.period
+        if self.fade:
+            period = 1.0 / claude_board.FPS
+        elif claude:
+            period = 1.0 / claude_board.fps(self.board.snapshot())
+        else:
+            period = self.period
         time.sleep(max(0.0, self.due - time.monotonic()))
         self.due = max(self.due + period, time.monotonic())
         img = self.claude_frame() if claude else self.gpu_frame()
