@@ -20,7 +20,7 @@ from PIL import Image, ImageDraw, ImageFilter, ImageFont
 HERE = os.path.dirname(os.path.abspath(__file__))
 FONT_DIR = os.path.join(HERE, "fonts")
 DEJAVU = "/usr/share/fonts/truetype/dejavu/"
-FPS = 2                      # frame rate while a session is working (comet, spinners)
+FPS = 4                      # frame rate while a session is working (comet, spinners)
 CALM_FPS = 2                 # frame rate otherwise: needs/done/idle tiles barely move
 STALE = 30                   # seconds without a push from the agent before the list is dropped
 
