@@ -11,7 +11,7 @@ switch with lightning-screen.
 
 Usage: dashboard.py [--rotate 0|90|180|270] [--fps 2] [--wireview NAME=DEV ...] [--preview out.png]
 """
-import argparse, collections, glob, io, os, signal, sys, threading, time
+import argparse, collections, functools, glob, io, os, signal, sys, threading, time
 from PIL import Image, ImageDraw, ImageFont
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -28,7 +28,7 @@ def font(size, bold=False):
     return ImageFont.truetype(os.path.join(FONT_DIR, "DejaVuSans-Bold.ttf" if bold else "DejaVuSans.ttf"), size)
 
 F = dict(title=font(30, True), label=font(22), small=font(18), value=font(34, True),
-         hero=font(96, True), unit=font(30), status=font(20, True))
+         hero=font(96, True), unit=font(30), status=font(20, True), badge=font(16, True))
 
 # pin rating for 12V-2x6 is 9.5 A; warn early
 PIN_WARN_A, PIN_CRIT_A = 8.0, 9.5
@@ -140,7 +140,7 @@ def badge(d, xy, st):
     label, col = st
     x, y = xy
     d.polygon([(x, y + 22), (x + 12, y), (x + 24, y + 22)], fill=col)           # warning triangle
-    d.text((x + 12, y + 13), "!", font=font(16, True), fill=SURFACE, anchor="mm")
+    d.text((x + 12, y + 13), "!", font=F["badge"], fill=SURFACE, anchor="mm")
     d.text((x + 32, y + 11), label, font=F["status"], fill=INK, anchor="lm")
 
 def meter(d, x, y, w, name, frac, value_txt, col=ACCENT):
@@ -177,9 +177,43 @@ def sparkline(d, box, series, label, unit, lo=None, hi=None):
 # ---- frame -----------------------------------------------------------------------------------
 HIST = 120  # samples (~60 s at 2 fps)
 
+# ---- cached text ---------------------------------------------------------------------------------
+# Most labels are the same every frame; rasterising them was most of the frame time. TextDraw keeps
+# each (font, text, anchor) as a ready glyph mask and only blits it.
+class TextDraw(ImageDraw.ImageDraw):
+    def textlength(self, text, font=None, *a, **k):
+        if a or k or font is None or not isinstance(text, str):
+            return super().textlength(text, font, *a, **k)
+        return _length(font, text)
+
+    def text(self, xy, text, fill=None, font=None, anchor=None, *a, **k):
+        if a or k or font is None or not isinstance(text, str) or "\n" in text:
+            return super().text(xy, text, fill, font, anchor, *a, **k)
+        m, ox, oy = _glyphs(font, text, anchor)
+        if m is not None:
+            self.bitmap((round(xy[0]) + ox, round(xy[1]) + oy), m, fill)
+
+
+@functools.lru_cache(maxsize=4096)
+def _length(f, text):
+    return f.getlength(text)
+
+
+@functools.lru_cache(maxsize=2048)
+def _glyphs(f, text, anchor):
+    """(mask, dx, dy): text drawn at (x, y) with this anchor covers mask placed at (x + dx, y + dy)."""
+    x0, y0, x1, y1 = f.getbbox(text, anchor=anchor)
+    if x1 <= x0 or y1 <= y0:
+        return None, 0, 0
+    p = 2                                           # anti-aliasing can spill past the box
+    m = Image.new("L", (x1 - x0 + 2 * p, y1 - y0 + 2 * p))
+    ImageDraw.Draw(m).text((p - x0, p - y0), text, fill=255, font=f, anchor=anchor)
+    return m, x0 - p, y0 - p
+
+
 def render(W, H, gpu_name, g, c, wv, hist):
     img = Image.new("RGB", (W, H), SURFACE)
-    d = ImageDraw.Draw(img)
+    d = TextDraw(img)
     pad = 24
 
     # header
